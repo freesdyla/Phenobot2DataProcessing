@@ -1,0 +1,25 @@
+%YAML:1.0
+rr_num_neighbor: 6 #less than 6, region growing crash
+rr_residual: 0.001
+rr_curvature: .05
+rr_angle: 5.
+max_d_jump: 65
+vox_size: 0.005
+normal_radius: 0.01
+cylinder_ransac_dist: 0.05
+neighboring_gps_threshold: 0.6
+pcl_view_time: 100000
+voxel_resolution: 0.004
+seed_resolution: 0.04
+color_importance: 0.0
+spatial_importance: 1.0
+normal_importance: 0.0
+sor_meank: 6
+sor_std: 0.5
+h_minvotes: 1000
+h_dx: 0.03
+h_nlines: 6
+h_granularity: 4
+skeleton_iteration: 30
+step_size: 0.1
+
