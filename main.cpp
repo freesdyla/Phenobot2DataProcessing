@@ -53,7 +53,6 @@ using Eigen::MatrixXf;
 #include <pcl/common/angles.h>
 #include <pcl/common/pca.h>
 #include <pcl/point_cloud.h>
-#include <pcl/surface/mls.h>
 #include <pcl/registration/icp.h>
 #include <pcl/registration/gicp.h>
 #include <pcl/registration/joint_icp.h>
@@ -65,6 +64,7 @@ using Eigen::MatrixXf;
 #include <pcl/octree/octree_search.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/console/time.h>
+#include <pcl/ml/kmeans.h>
 
 
 #include "opencv2/imgproc/imgproc.hpp"
@@ -146,6 +146,9 @@ int h_granularity = 4;
 int cnt = 0;
 int skeleton_iteration = 20;
 float step_size;
+float min_linearity;
+int min_branch_size;
+int data_set = 0;	//0 2015; 1 2017
 
 const double utm_o_x = 441546.;
 const double utm_o_y = 4654933.;
@@ -343,7 +346,7 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 	PointCloud3 X;
 
 	X.readPCL(cloud);
-
+	
 #if 0
 	pcl::search::Search<PointT>::Ptr tree = boost::shared_ptr<pcl::search::Search<PointT>> (new pcl::search::KdTree<PointT>);
 	NormalCloudT::Ptr normals(new NormalCloudT);
@@ -369,19 +372,23 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 	// center cloud and compute new bounding box
 	X.getMinMax3D(&minP, &maxP);
 	d = (maxP-minP).norm();
-	if (d == 0.0) 
-	{
+	if (d == 0.0) {
+
 		fprintf(stderr, "Error: all points in point cloud identical\n");
 		return 1;
 	}
+
 	X.shiftToOrigin();
+
 	X.getMinMax3D(&minPshifted, &maxPshifted);
 
 	// estimate size of Hough space
 	if (opt_dx == 0.0) {
+
 		opt_dx = d / 64.0;
 	}
 	else if (opt_dx >= d) {
+
 		fprintf(stderr, "Error: dx too large\n");
 		return 1;
 	}
@@ -392,12 +399,12 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 
 	// first Hough transform
 
-	try 
-	{
+	try {
+
 		hough = new Hough(minPshifted, maxPshifted, opt_dx, granularity);
 	} 
-	catch (const std::exception &e) 
-	{
+	catch (const std::exception &e) {
+
 		fprintf(stderr, "Error: cannot allocate memory for %.0f Hough cells"
 		    " (%.2f MB)\n", num_cells, 
 		    (double(num_cells) / 1000000.0) * sizeof(unsigned int));
@@ -405,7 +412,6 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 	}
 
 	hough->add(X);
-
 
 	a_vec.clear();
 	b_vec.clear();
@@ -416,8 +422,7 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 	double rc;
 	unsigned int nvotes;
 	int nlines = 0;
-	do 
-	{
+	do {
 		Vector3d a; // anchor point of line
 		Vector3d b; // direction of line
 
@@ -428,22 +433,17 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 		X.pointsCloseToLine(a, b, opt_dx, &Y);
 
 		rc = orthogonal_LSQ(Y, &a, &b);
-		if (rc==0.0) break;
+		if ( rc == 0.0 ) break;
 
 		X.pointsCloseToLine(a, b, opt_dx, &Y);
+
 		nvotes = Y.points.size();
-		if (nvotes < (unsigned int)opt_minvotes) break;
+
+		if ( nvotes < (unsigned int)opt_minvotes ) break;
 
 		rc = orthogonal_LSQ(Y, &a, &b);
-		if (rc==0.0) break;
 
-		//check if line vertical enough
-		if ( std::abs(b.x) < 0.95 )
-		{
-			X.removePoints(Y);
-			nlines++;
-			continue;	
-		}
+		if ( rc == 0.0 ) break;
 
 		a = a + X.shift;
 
@@ -451,9 +451,9 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 
 		if(b.x > 0.) b = b*-1.;
 
-		double t = (0.65 - a.x)/b.x;
+		double t = (0.6 - a.x)/b.x;
 
-		a.x = 0.65;
+		a.x = 0.6;
 		a.y += t*b.y;
 		a.z += t*b.z;	
 
@@ -491,9 +491,15 @@ struct SVVertexProperty
 {
 	uint32_t supervoxel_label;
 	pcl::Supervoxel<PointT>::Ptr supervoxel;
-	float convexity;
+	//float convexity;
 	//float x, y, z;
 	//PointCloudT cloud;
+	uint32_t index;
+	int vertex;
+	bool near_junction = false;
+	std::vector<uint32_t> children;
+	std::vector<uint32_t> parents;
+	std::vector<int> cluster_indices;
 };
 
 struct found_goal{};
@@ -737,8 +743,9 @@ void PB_MHB(sv_graph_t & sv_graph, const double seed_resolution, Eigen::MatrixXd
 }
 #endif
 
-struct DepthFrame
-{
+struct DepthFrame {
+
+	EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 	double utm_x;
 	double utm_y;
 	double odo_x;
@@ -750,23 +757,23 @@ struct DepthFrame
 	Eigen::Matrix4f* world2robot;
 	bool invalid;
 
-	DepthFrame()
-	{
+	DepthFrame() {
+
 		world2cam = new Eigen::Matrix4f();
 		world2robot = new Eigen::Matrix4f();
 	}
 };
 
-struct BGRD
-{
+struct BGRD {
+
 	unsigned char b;
 	unsigned char g;
 	unsigned char r;
 	unsigned short d;
 };
 
-bool compareByUTC(const DepthFrame & a, const DepthFrame & b)
-{
+bool compareByUTC(const DepthFrame & a, const DepthFrame & b) {
+
 	return a.utc < b.utc;
 }
 
@@ -774,8 +781,8 @@ const int depth_width = 512;
 const int depth_height = 424;
 const int depth_size = depth_width*depth_height;
 
-void readDataBinaryFile(std::string file_name, BGRD* buffer)
-{
+void readDataBinaryFile(std::string file_name, BGRD* buffer) {
+
 	std::ifstream in(file_name, std::ios::in | std::ios::binary);
 
 	in.read((char*)&buffer[0], depth_size*sizeof(BGRD));
@@ -784,12 +791,1591 @@ void readDataBinaryFile(std::string file_name, BGRD* buffer)
 }
 
 
-
 cv::Mat cur_depth_cv, pre_depth_cv, pre_pre_depth_cv, depth_canvas_cv;
 
+void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f stem_dir, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer) {
 
-void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer)
-{
+	if(cloud->size() < 100) return;
+
+	PointCloudT::Ptr filtered_cloud(new PointCloudT);	
+
+	PointCloudT::Ptr tmp_cloud(new PointCloudT);	
+
+	pcl::StatisticalOutlierRemoval<PointT> sor;
+	sor.setInputCloud(cloud);
+	sor.setMeanK(10);
+	sor.setStddevMulThresh(1.0);
+	sor.filter(*filtered_cloud);
+
+	Eigen::Vector4f min_pt, max_pt;
+
+	pcl::getMinMax3D(*filtered_cloud, min_pt, max_pt);
+
+	sv_graph_t skeleton_graph;
+
+	pcl::PassThrough<PointT> pass;
+	pass.setInputCloud (filtered_cloud);
+	pass.setFilterFieldName ("x");
+	pass.setFilterLimitsNegative (false);
+
+	pcl::PassThrough<PointT> pass_in_cluster;
+	pass_in_cluster.setFilterFieldName ("x");
+	pass_in_cluster.setInputCloud(filtered_cloud);
+
+
+	float slice_thickness = 0.01f;
+
+	viewer->removeAllPointClouds();
+	viewer->removeAllShapes();
+
+	pcl::search::KdTree<PointT>::Ptr tree (new pcl::search::KdTree<PointT>);
+	tree->setInputCloud (filtered_cloud);
+	
+	pcl::EuclideanClusterExtraction<PointT> ec;
+	ec.setClusterTolerance (0.007); // 2cm
+	ec.setMinClusterSize (10);
+	ec.setMaxClusterSize (25000);
+	ec.setSearchMethod (tree);
+	ec.setInputCloud (filtered_cloud);
+
+	uint32_t rgb;
+
+	int cnt = 0;
+
+	PointCloudT::Ptr centroid_cloud(new PointCloudT);
+
+	pcl::PointIndices::Ptr pre_indices(new pcl::PointIndices);
+
+	bool first_slice = true;	
+	
+	pcl::KdTreeFLANN<PointT> kdtree;
+
+	kdtree.setInputCloud(filtered_cloud);
+
+	for(float x=min_pt(0); x<=max_pt(0); x += slice_thickness) {
+
+		pass.setFilterLimits (x, x+slice_thickness);
+
+		pcl::PointIndices::Ptr indices(new pcl::PointIndices);	
+		
+		pass.filter(indices->indices);
+
+		std::vector<int> tmp_indices;
+
+		tmp_indices = indices->indices;
+
+		// append previous slice
+		indices->indices.insert(indices->indices.end(), pre_indices->indices.begin(), pre_indices->indices.end());
+
+		pre_indices->indices = tmp_indices;
+
+		ec.setIndices(indices);
+
+		std::vector<pcl::PointIndices> cluster_indices;
+
+		ec.extract(cluster_indices);
+
+		if(first_slice) {
+
+			first_slice = false;
+
+			for(int i=0; i<cluster_indices.size(); i++) {
+
+				Eigen::Vector4f centroid;
+
+				pcl::compute3DCentroid(*filtered_cloud, cluster_indices[i], centroid);
+
+				PointT p; p.getVector3fMap() = centroid.head(3);
+
+				std::vector<int> k_indices; std::vector<float> k_sqr_distances;
+
+				if( kdtree.nearestKSearch(p, 1, k_indices, k_sqr_distances) == 1) {
+
+					SVVertexProperty vp;
+
+					vp.index = k_indices[0];	
+
+					sv_vertex_t v = boost::add_vertex(vp, skeleton_graph);
+				}
+			}
+
+			continue;
+		}
+
+		pass_in_cluster.setFilterLimits (x, x+slice_thickness);
+
+		for(auto & two_layer_cluster : cluster_indices) {
+
+			pcl::PointIndices::Ptr lower_slice_inliers_in_cluster(new pcl::PointIndices);
+
+			pcl::PointIndices::Ptr upper_slice_inliers_in_cluster(new pcl::PointIndices);		
+
+			boost::shared_ptr<std::vector<int>> two_layer_cluster_ptr(new std::vector<int>(two_layer_cluster.indices));
+
+			pass_in_cluster.setIndices( two_layer_cluster_ptr );			
+
+			pass_in_cluster.setFilterLimitsNegative (false);
+
+			pass_in_cluster.filter(lower_slice_inliers_in_cluster->indices);
+
+			pass_in_cluster.setFilterLimitsNegative (true);
+
+			pass_in_cluster.filter(upper_slice_inliers_in_cluster->indices);
+	
+			std::vector<pcl::PointIndices> lower_clusters_indices_in_cluster;
+
+			std::vector<pcl::PointIndices> upper_clusters_indices_in_cluster;
+		
+			ec.setIndices(lower_slice_inliers_in_cluster);
+
+			ec.extract(lower_clusters_indices_in_cluster);
+
+			ec.setIndices(upper_slice_inliers_in_cluster);
+
+			ec.extract(upper_clusters_indices_in_cluster);
+
+			for(auto & cl : lower_clusters_indices_in_cluster) 	
+			{
+				Eigen::Vector4f lower_centroid;
+
+				pcl::compute3DCentroid(*filtered_cloud, cl, lower_centroid);
+
+				PointT p; p.getVector3fMap() = lower_centroid.head(3);
+
+				std::vector<int> k_indices; std::vector<float> k_sqr_distances;
+
+				if( kdtree.nearestKSearch(p, 1, k_indices, k_sqr_distances) == 1) {
+
+					SVVertexProperty vp;
+
+					vp.index = k_indices[0];	
+
+					vp.cluster_indices = cl.indices;
+
+					sv_vertex_t new_vertex = boost::add_vertex(vp, skeleton_graph);
+
+					for(auto & cu : upper_clusters_indices_in_cluster) {
+
+						Eigen::Vector4f upper_centroid;
+
+						pcl::compute3DCentroid(*filtered_cloud, cu, upper_centroid);
+				
+						PointT p_u; p_u.getVector3fMap() = upper_centroid.head(3); 
+
+						k_indices.clear(); k_sqr_distances.clear();
+
+						if( kdtree.nearestKSearch(p_u, 1, k_indices, k_sqr_distances) == 1 )
+							for(int old_vertex=boost::num_vertices(skeleton_graph)-1; old_vertex>=0; old_vertex--) 
+								if( skeleton_graph[old_vertex].index == k_indices[0] ) {
+
+									skeleton_graph[old_vertex].parents.push_back(new_vertex);
+
+									skeleton_graph[new_vertex].children.push_back(old_vertex);
+									
+									sv_edge_t edge; bool edge_added;
+
+									boost::tie(edge, edge_added) = boost::add_edge(old_vertex, new_vertex, skeleton_graph);
+
+									skeleton_graph[edge].weight = (lower_centroid - upper_centroid).norm();
+
+									break;
+								}
+					}
+				}
+			}
+		}
+
+		uint32_t r = cnt % 2 == 0 ? 255 : 0;
+
+		rgb = r << 16 | 0 << 8 | 255;
+
+		for(auto & i : pre_indices->indices)	
+			filtered_cloud->points[i].rgb =  *reinterpret_cast<float*>(&rgb);
+
+		cnt++;
+	}
+
+	viewer->addPointCloud(filtered_cloud, "slice cloud");
+
+
+/*	BGL_FORALL_VERTICES(v, skeleton_graph, sv_graph_t) {
+
+		uint32_t rgb = 0 << 16 | 255 << 8 | 0;
+
+		filtered_cloud->points[skeleton_graph[v].index].rgb = *reinterpret_cast<float*>(&rgb);
+
+		for(auto & vertex : skeleton_graph[v].children) {
+
+			viewer->addLine(filtered_cloud->points[skeleton_graph[vertex].index], filtered_cloud->points[skeleton_graph[v].index], 1, 0, 0, to_string(cv::getTickCount()));
+		}
+
+		for(auto & vertex : skeleton_graph[v].parents) {
+
+			viewer->addLine(filtered_cloud->points[skeleton_graph[vertex].index], filtered_cloud->points[skeleton_graph[v].index], 1, 1, 1, to_string(cv::getTickCount()));
+		}
+		
+		viewer->spin();
+		
+	}
+*/
+	BGL_FORALL_EDGES(e, skeleton_graph, sv_graph_t) {
+
+		sv_vertex_t s = boost::source(e, skeleton_graph);
+
+		sv_vertex_t t = boost::target(e, skeleton_graph);
+
+		int s_idx = skeleton_graph[s].index;
+
+		int t_idx = skeleton_graph[t].index;
+
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+
+	cout<<"initial skeleton\n";
+	
+//	viewer->spin();
+
+	// remove loops in graph with MST
+	std::vector<sv_edge_t> spanning_tree;
+
+	boost::kruskal_minimum_spanning_tree(skeleton_graph, std::back_inserter(spanning_tree), boost::weight_map(boost::get(&SVEdgeProperty::weight, skeleton_graph)) );
+
+	sv_graph_t mst(boost::num_vertices(skeleton_graph));
+
+	BGL_FORALL_VERTICES(v, skeleton_graph, sv_graph_t)
+		mst[v] = skeleton_graph[v];
+
+	for(auto & e : spanning_tree)
+	{
+		sv_vertex_t s = boost::source(e, skeleton_graph);
+
+		sv_vertex_t t = boost::target(e, skeleton_graph);
+
+		sv_edge_t new_e;
+
+		bool edge_added;		
+
+		boost::tie(new_e, edge_added) = boost::add_edge(s, t, mst);
+
+	/*	mst[s].index = skeleton_graph[s].index;
+
+		mst[s].children = skeleton_graph[s].children;
+
+		mst[s].parents = skeleton_graph[s].parents;
+
+		mst[s].cluster_indices = skeleton_graph[s].cluster_indices;
+
+		mst[t].index = skeleton_graph[t].index;
+
+		mst[t].children = skeleton_graph[t].children;
+
+		mst[t].parents = skeleton_graph[t].parents;
+
+		mst[t].cluster_indices = skeleton_graph[t].cluster_indices;
+*/
+		mst[new_e].weight = skeleton_graph[e].weight;
+
+	}
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+		int s_idx = mst[boost::source(e, mst)].index;
+
+		int t_idx = mst[boost::target(e, mst)].index;
+		
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+	
+	cout<<"mst done\n";
+
+//	viewer->spin();
+
+
+	// prune short branches	
+#if 1
+	std::set<sv_vertex_t> vertices_to_remove;
+
+	BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+		// process leaf node
+		if (boost::out_degree(v, mst) != 1) continue;
+
+		sv_vertex_t cur_v = *(adjacent_vertices(v, mst).first);
+
+		std::vector<sv_vertex_t> visited_vertices;
+
+		visited_vertices.push_back(v);
+			
+		while (true) {
+
+			const int num_neighbors = boost::out_degree(cur_v, mst);
+
+			if( num_neighbors == 1) {	// leaf node
+				
+				visited_vertices.push_back(cur_v);
+				break;
+			}
+			else if( num_neighbors == 2 ) { // can continue
+				
+				BGL_FORALL_ADJ(cur_v, adj, mst, sv_graph_t) {
+
+					if( adj != visited_vertices.back() ) {
+
+						visited_vertices.push_back(cur_v);
+						cur_v = adj;
+						break;
+					}
+				}								
+ 
+				continue;
+			}
+			else 	//intersection 
+				break;
+		}
+
+		if ( visited_vertices.size() < min_branch_size )
+			for(auto & visited_vertex : visited_vertices)
+				vertices_to_remove.insert(visited_vertex);
+	}
+
+
+	for(auto iter = vertices_to_remove.begin(); iter != vertices_to_remove.end(); ++iter) 
+		boost::clear_vertex(*iter, mst);
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) 
+		viewer->addLine(filtered_cloud->points[mst[boost::source(e, mst)].index], filtered_cloud->points[mst[boost::target(e, mst)].index], 1, 1, 1, to_string(cv::getTickCount()));		
+
+
+	cout<<"prune done\n";
+	
+//	viewer->spin();
+#endif
+
+
+	// refine branching points
+#if 1
+	float stop_branching_dist = 0.02f;
+	while(true)
+	{
+		bool modify = false;
+
+		for(int v=boost::num_vertices(mst)-1; v>0; v--) {
+
+			// find branch between leaf and stem
+			if(boost::out_degree(v, mst) != 3 || mst[v].children.size() != 2 || mst[v].parents.size() != 1) continue;
+
+			if( mst[mst[v].parents[0]].children.size() > 1 ) continue;
+
+			std::vector<int> indices = mst[v].cluster_indices;
+
+			std::vector<cv::Point3f> cv_points(indices.size());
+
+			cv::Mat labels;
+
+			for (int i = 0; i < cv_points.size(); i++) {
+
+				cv::Point3f point;
+				point.x = filtered_cloud->points[indices[i]].x;
+				point.y = filtered_cloud->points[indices[i]].y;
+				point.z = filtered_cloud->points[indices[i]].z;
+				cv_points[i] = point;
+			}
+
+			cv::Mat object_centers;
+		
+			cv::kmeans(cv_points, 2, labels, cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 40, 0.001), 10, cv::KMEANS_PP_CENTERS, object_centers);
+
+			cv::Vec3f & center1 = object_centers.at<cv::Vec3f>(0, 0);
+
+			cv::Vec3f & center2 = object_centers.at<cv::Vec3f>(1, 0);
+
+			float dist = std::sqrt( pow(center1[0]-center2[0], 2.f)+pow(center1[1]-center2[1], 2.f)+pow(center1[2]-center2[2], 2.f) );
+
+			if( dist < stop_branching_dist) continue;
+
+			PointT p1, p2;
+
+			p1.x = center1[0]; p1.y = center1[1]; p1.z = center1[2];
+			p2.x = center2[0]; p2.y = center2[1]; p2.z = center2[2];
+
+			std::vector<PointT> point_pair(2);
+	
+			point_pair[0].x = center1[0]; point_pair[0].y = center1[1]; point_pair[0].z = center1[2];
+			point_pair[1].x = center2[0]; point_pair[1].y = center2[1]; point_pair[1].z = center2[2];
+
+			uint32_t rgb = 255 << 16 | 255 << 8 | 255;
+    
+			int p1_child_idx = -1;			
+
+			if( ( p1.getVector3fMap() - p2.getVector3fMap() ).dot( 
+			      filtered_cloud->points[mst[mst[v].children[0]].index].getVector3fMap() 
+			      - filtered_cloud->points[mst[mst[v].children[1]].index].getVector3fMap() ) 
+			     > 0.f )
+				p1_child_idx = 0;
+			else
+				p1_child_idx = 1;
+			
+			mst[mst[v].parents[0]].children.clear();
+
+			for(int p=0; p<2; p++) {
+		
+				std::vector<int> k_indices; std::vector<float> k_sqr_distances;
+
+				if( kdtree.nearestKSearch(point_pair[p], 1, k_indices, k_sqr_distances) == 1) {
+			
+					SVVertexProperty vp;
+
+					vp.index = k_indices[0];	
+
+					for (int i = 0; i < cv_points.size(); i++)
+						if( labels.at<int>(i, 0) == p ) 
+							vp.cluster_indices.push_back(indices[i]);
+
+					uint32_t rgb_p = ( 255*(1-p) << 16 | 255*p << 8 | 0 );
+
+					for(auto & i : vp.cluster_indices) 
+						filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb_p);
+
+					vp.children = mst[v].children;
+
+					vp.parents = mst[v].parents;
+
+					vp.near_junction = true;
+
+					sv_vertex_t new_vertex = boost::add_vertex(vp, mst);
+
+					const int p_child_idx = p == 0 ? p1_child_idx : 1 - p1_child_idx;
+
+					boost::add_edge(new_vertex, mst[v].children[p_child_idx], mst);
+
+					boost::add_edge(new_vertex, mst[v].parents[0], mst);
+
+				//	filtered_cloud->points[k_indices[0]].rgb = *reinterpret_cast<float*>(&rgb);
+
+					mst[mst[v].children[p_child_idx]].parents[0] = new_vertex;
+
+					mst[mst[v].parents[0]].children.push_back(new_vertex);
+				}
+				else cout<<"kdtree for p fail\n";
+			}
+						
+			boost::clear_vertex(v, mst); 
+
+			mst[v].near_junction = true;
+
+			modify = true;
+
+			break;
+		}
+
+#if 0
+		viewer->removeAllShapes();
+
+		BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+			sv_vertex_t s = boost::source(e, mst);
+
+			sv_vertex_t t = boost::target(e, mst);
+
+			int s_idx = mst[s].index;
+
+			int t_idx = mst[t].index;
+
+			viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+		}
+
+		viewer->updatePointCloud(filtered_cloud, "slice cloud");
+		
+		viewer->spin();
+#endif
+
+		if( !modify ) break;
+	}
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t)
+		viewer->addLine(filtered_cloud->points[mst[boost::source(e, mst)].index], filtered_cloud->points[mst[boost::target(e, mst)].index], 1, 1, 1, to_string(cv::getTickCount()));		
+
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+
+	cout<<"refine branching points done\n";
+	
+//	viewer->spin();
+#endif
+
+	// prune short branches	
+#if 0
+	vertices_to_remove.clear();
+
+	BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+		// process leaf node
+		if (boost::out_degree(v, mst) != 1) continue;
+
+		sv_vertex_t cur_v = *(adjacent_vertices(v, mst).first);
+
+		std::vector<sv_vertex_t> visited_vertices;
+
+		visited_vertices.push_back(v);
+			
+		while (true) {
+
+			const int num_neighbors = boost::out_degree(cur_v, mst);
+
+			if( num_neighbors == 1) {	// leaf node
+				
+				visited_vertices.push_back(cur_v);
+				break;
+			}
+			else if( num_neighbors == 2 ) { // can continue
+				
+				BGL_FORALL_ADJ(cur_v, adj, mst, sv_graph_t) {
+
+					if( adj != visited_vertices.back() ) {
+
+						visited_vertices.push_back(cur_v);
+						cur_v = adj;
+						break;
+					}
+				}								
+ 
+				continue;
+			}
+			else 	//intersection 
+				break;
+		}
+
+		if ( visited_vertices.size() < min_branch_size )
+			for(auto & visited_vertex : visited_vertices)
+				vertices_to_remove.insert(visited_vertex);
+	}
+
+
+	for(auto iter = vertices_to_remove.begin(); iter != vertices_to_remove.end(); ++iter) 
+		boost::clear_vertex(*iter, mst);
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) 
+		viewer->addLine(filtered_cloud->points[mst[boost::source(e, mst)].index], filtered_cloud->points[mst[boost::target(e, mst)].index], 1, 1, 1, to_string(cv::getTickCount()));		
+
+
+	cout<<"prune done\n";
+	
+//	viewer->spin();
+#endif
+
+	// ***************************partition segments*************************************
+	rgb = 255 << 16 | 255 << 8 | 0;
+
+	std::vector<std::vector<sv_vertex_t>> segment_vec;
+
+	std::vector<bool> visited_map(boost::num_vertices(mst), false);
+
+	BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+		const int degree = boost::out_degree(v, mst);
+
+		if( degree == 2 || degree == 0) continue;
+		
+		visited_map[v] = true;
+
+		BGL_FORALL_ADJ(v, adj, mst, sv_graph_t) {
+	
+			if( visited_map[adj] || boost::out_degree(adj, mst) > 2 ) 
+				continue;
+
+			sv_vertex_t cur_v = adj;
+
+			std::vector<sv_vertex_t> segment;
+
+			if(degree == 1) 
+				segment.push_back(v);
+			else
+				segment.push_back(cur_v);
+
+			visited_map[cur_v] = true;
+
+			bool first_time = true;
+
+			while(true) {
+
+				const int num_neighbors = boost::out_degree(cur_v, mst);
+
+				if( num_neighbors == 1) { //another leaf node
+			
+					segment.push_back(cur_v);
+
+					visited_map[cur_v] = 1;
+
+					break;
+				}
+				else if( num_neighbors == 2 ) {
+
+					BGL_FORALL_ADJ(cur_v, adj_cur, mst, sv_graph_t) {
+						
+						if(degree != 1) {
+
+							if( first_time ) { // first time
+
+								if( adj_cur != v ) { 
+
+									cur_v = adj_cur;
+
+									first_time = false;
+
+									break;
+								}
+							}
+							else {
+							
+								if( adj_cur != segment.back() ) {
+
+									segment.push_back(cur_v);
+
+									visited_map[cur_v] = true;
+
+									cur_v = adj_cur;
+
+									break;
+								}
+							}
+						}
+						else {	// degree == 1
+	
+							if( adj_cur != segment.back() ) {
+
+								segment.push_back(cur_v);
+
+								visited_map[cur_v] = true;
+
+								cur_v = adj_cur;
+
+								break;
+							}							
+						}
+					}									
+	 
+					continue;
+				}
+				else // find a branching point
+					break;
+			}
+
+			segment_vec.push_back(segment);
+
+
+//			for(auto & v : segment)	filtered_cloud->points[mst[v].index].rgb = *reinterpret_cast<float*> (&rgb);
+
+		//	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+	
+		//	viewer->spin();
+		}
+	}
+
+	rgb = 255 << 16 | 255 << 8 | 0;
+
+//	for(auto & segment : segment_vec)
+//		for(auto & v : segment) 
+//			filtered_cloud->points[mst[v].index].rgb = *reinterpret_cast<float*> (&rgb);
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+
+	cout<<"partition segments done\n";
+	
+	//viewer->spin();
+
+
+	pcl::PCA<PointT> pca;
+
+	pca.setInputCloud(filtered_cloud);
+
+	pcl::PointIndices::Ptr point_indices(new pcl::PointIndices);
+
+
+	// break V type segments
+	std::vector<std::pair<int, int>> segment_to_break_indices;	//with index of the breaking node
+
+	int seg_idx = 0;
+
+	for(auto & segment : segment_vec) {
+
+		if( segment.size() > 2*min_branch_size) {
+
+			if( filtered_cloud->points[mst[segment[0]].index].x - filtered_cloud->points[mst[segment[1]].index].x < 0.f 
+			  &&filtered_cloud->points[mst[segment.back()].index].x - filtered_cloud->points[mst[segment[segment.size()-2]].index].x < 0.f ) {
+
+				int break_idx = -1;
+			
+				for(int i=min_branch_size; i<segment.size()-min_branch_size; i++) {
+					
+					float x = filtered_cloud->points[mst[segment[i]].index].x;
+
+					float xm = filtered_cloud->points[mst[segment[i-1]].index].x;
+
+					float xp = filtered_cloud->points[mst[segment[i+1]].index].x;
+
+					if( x > xm && x> xp ) {
+
+						break_idx = i;
+
+						//boost::clear_vertex(segment[break_idx], mst); //dont break connection in graph, break connection in segments
+						
+						break;
+					}
+				}
+
+				if( break_idx != -1 )
+					segment_to_break_indices.push_back(std::make_pair(seg_idx, break_idx));
+
+//				for(auto & v : segment) filtered_cloud->points[mst[v].index].rgb = *reinterpret_cast<float*> (&rgb); 
+			}
+		}
+
+		++seg_idx;
+	}
+
+	for(auto & pair : segment_to_break_indices) {
+
+		const int seg_idx = pair.first;
+
+		const int break_idx = pair.second;
+
+		std::vector<sv_vertex_t> new_segment;
+
+		new_segment.insert(new_segment.end(), segment_vec[seg_idx].begin()+break_idx, segment_vec[seg_idx].end());
+
+		segment_vec.push_back(new_segment);
+
+		segment_vec[seg_idx].erase(segment_vec[seg_idx].begin()+break_idx, segment_vec[seg_idx].end());
+	}
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+		int s_idx = mst[boost::source(e, mst)].index;
+
+		int t_idx = mst[boost::target(e, mst)].index;
+
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+
+	
+
+	//************************ detect stems using 3d hough line*******************************
+	centroid_cloud->clear();
+
+	BGL_FORALL_VERTICES(v, mst, sv_graph_t)
+		if( boost::out_degree(v, mst) > 0 )
+			centroid_cloud->push_back(filtered_cloud->points[mst[v].index]);
+
+	cout<<"centroids size "<<centroid_cloud->size()<<"\n";
+
+	std::vector<Eigen::Vector3f> a_vec, b_vec;
+
+	Hough3DLine(centroid_cloud, viewer, a_vec, b_vec, h_dx, h_nlines, h_minvotes, h_granularity);
+
+	//viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+		const int s_idx = mst[boost::source(e, mst)].index;
+
+		const int t_idx = mst[boost::target(e, mst)].index;
+
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+
+	//std::cout<<"num line detected "<<a_vec.size()<<"\n";
+
+	float line_len = 1.1f;
+
+	std::vector<int> valid_stem_line_indices;
+
+	for(int i=0; i<a_vec.size(); i++) {
+
+		bool valid_line = true;
+
+		//check root position and line direction
+		if( a_vec[i](2) > 1.3f || a_vec[i](2) < 0.7f || b_vec[i](0) > -0.9) valid_line = false;
+		
+		for (int j=0; valid_line && j<i; j++) {
+
+			std::pair<Eigen::Vector3f, Eigen::Vector3f> segment1(a_vec[i], a_vec[i] + line_len*b_vec[i]);
+			std::pair<Eigen::Vector3f, Eigen::Vector3f> segment2(a_vec[j], a_vec[j] + line_len*b_vec[j]);
+
+			float l2l_dist = dist3D_Segment_to_Segment(segment1, segment2);
+
+			if(l2l_dist < 0.08f) 
+				valid_line = false;
+		}
+		
+		pcl::PointXYZ p1(a_vec[i](0), a_vec[i](1), a_vec[i](2));
+
+		Eigen::Vector3f vector = a_vec[i] + line_len*b_vec[i];
+
+		pcl::PointXYZ p2(vector(0), vector(1), vector(2));
+
+		if(!valid_line)	{
+
+			viewer->addLine(p1, p2, 0.5, 0.5, 0.5, "line"+to_string(cv::getTickCount()));	
+
+			continue;
+		}		
+		else 
+			viewer->addLine(p1, p2, 1, 0, 0, "line"+to_string(cv::getTickCount()));	
+
+		valid_stem_line_indices.push_back(i);
+	}
+
+	//viewer->spin();
+
+
+	// label stem inlier slices
+	std::vector<int> stem_inlier_map(boost::num_vertices(mst), -1);
+
+	rgb = 255 << 16 | 255 <<8 | 255;
+
+	BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+		float min_dist = std::numeric_limits<float>::max();
+
+		int best_idx = -1;
+
+		for(auto & stem_line_index : valid_stem_line_indices) {
+		
+			Eigen::Vector3f vector = filtered_cloud->points[mst[v].index].getVector3fMap() - a_vec[stem_line_index];
+
+			float point_to_line_dist = (vector - vector.dot(b_vec[stem_line_index])*b_vec[stem_line_index]).norm();
+
+			if( point_to_line_dist < min_dist) {
+		
+				min_dist = point_to_line_dist;
+
+				best_idx = stem_line_index;
+			}
+		}
+
+		if(best_idx != -1 && min_dist < 0.02f) {
+		
+			stem_inlier_map[v] = best_idx;
+
+			for(auto & i : mst[v].cluster_indices)
+				filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+		}			
+	}
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+
+	
+
+
+
+#if 0
+
+	// find vertices on stems
+	point_indices->indices.resize(3);
+
+	rgb = 255<<16 | 255<<8 | 255;
+
+	for(auto & segment : segment_vec) {
+
+		if(segment.size() < min_branch_size)
+			continue;
+
+		for(auto niter = segment.begin()+1; niter != segment.end()-1; ++niter) {
+
+			if( mst[*niter].near_junction )
+				continue;
+			
+			Eigen::Vector3f pre_p = filtered_cloud->points[mst[*(niter-1)].index].getVector3fMap();
+
+			Eigen::Vector3f cur_p = filtered_cloud->points[mst[*(niter)].index].getVector3fMap();
+
+			Eigen::Vector3f nex_p = filtered_cloud->points[mst[*(niter+1)].index].getVector3fMap();
+
+			for(auto & stem_line_index: valid_stem_line_indices) {
+
+				Eigen::Vector3f base_to_centroid = cur_p - a_vec[stem_line_index];
+
+				const float centroid_to_stem_line_dist = (base_to_centroid - base_to_centroid.dot(b_vec[stem_line_index])*b_vec[stem_line_index]).norm();
+		
+				if( centroid_to_stem_line_dist < 0.03f 
+				    && std::abs((pre_p-cur_p).normalized().dot(b_vec[stem_line_index])) > 0.8
+				    && std::abs((nex_p-cur_p).normalized().dot(b_vec[stem_line_index])) > 0.8
+				  ) {
+					
+					point_indices->indices = mst[*niter].cluster_indices;
+
+					pca.setIndices(point_indices);
+
+					Eigen::Vector3f eigenvalues = pca.getEigenValues();
+
+					PointCloudT::Ptr origional(new PointCloudT);
+
+					pcl::copyPointCloud(*filtered_cloud, point_indices->indices, *origional);
+
+					PointCloudT::Ptr projected(new PointCloudT);
+
+					pca.project(*origional, *projected);
+
+					Eigen::Vector4f min_pt, max_pt;
+
+					pcl::getMinMax3D(*projected, min_pt, max_pt);
+
+					//cout<< (max_pt-min_pt).transpose()<<"\n";
+
+					float surface_variation = eigenvalues(2)/eigenvalues.sum();
+
+					//cout<<surface_variation<<"\n";
+
+					if( surface_variation > 0.1) 
+						break;
+
+
+					for(auto & index : mst[*niter].cluster_indices) 
+						filtered_cloud->points[index].rgb = *reinterpret_cast<float*>(&rgb);
+					
+		
+					//stem_segment_indices.push_back(idx);
+
+				//	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+				//	viewer->spin();
+			
+					break;
+				}
+			}
+
+		
+
+		}
+
+	}
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+#endif
+
+
+	// plant segmentation
+#if 1
+	std::vector<int> stem_id_for_segment(segment_vec.size(), -1);
+	std::vector<bool> first_node_end_map(segment_vec.size(), true);	// is segment.front() the node closest to the stem line?
+
+	rgb = 255<<16 | 255<<8 | 0;
+
+	float max_gap_dist = 0.1f;
+
+	seg_idx = 0;
+
+	for(auto & segment : segment_vec) {
+
+		point_indices->indices.clear();
+
+		for(auto & v : segment)
+			point_indices->indices.insert(point_indices->indices.end(), mst[v].cluster_indices.begin(), mst[v].cluster_indices.end());
+
+		//for( auto & i : point_indices->indices ) filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+
+		pca.setIndices(point_indices);
+
+		Eigen::Vector3f major_vector = pca.getEigenVectors().col(0);
+		Eigen::Vector3f mean = pca.getMean().head(3);
+
+		float min_dist_to_stem = std::numeric_limits<float>::max();
+
+		int best_stem_idx = -1;
+
+		int first_node = true;
+
+		for(auto & stem_line_index: valid_stem_line_indices) {
+
+			Eigen::Vector3f vector = filtered_cloud->points[mst[segment.front()].index].getVector3fMap() - a_vec[stem_line_index];
+
+			float point_to_stem_line_dist = (vector - vector.dot(b_vec[stem_line_index])*b_vec[stem_line_index]).norm();
+	
+			if( point_to_stem_line_dist < min_dist_to_stem) {
+		
+				min_dist_to_stem = point_to_stem_line_dist;
+
+				best_stem_idx = stem_line_index;
+
+				first_node = true;
+			}
+
+			vector = filtered_cloud->points[mst[segment.back()].index].getVector3fMap() - a_vec[stem_line_index];
+
+			point_to_stem_line_dist = (vector - vector.dot(b_vec[stem_line_index])*b_vec[stem_line_index]).norm();
+	
+			if( point_to_stem_line_dist < min_dist_to_stem) {
+		
+				min_dist_to_stem = point_to_stem_line_dist;
+
+				best_stem_idx = stem_line_index;
+
+				first_node = false;
+			}
+		}
+
+		if(best_stem_idx != -1 
+		&& min_dist_to_stem < max_gap_dist) {
+
+			stem_id_for_segment[seg_idx] = best_stem_idx;
+			
+			first_node_end_map[seg_idx] = first_node;
+
+		//	if(first_node) filtered_cloud->points[mst[segment.front()].index].rgb = rgb;
+		//	else filtered_cloud->points[mst[segment.back()].index].rgb = rgb;	
+		}
+			
+		++seg_idx;
+	}
+
+
+	std::vector<float> random_color_for_stems(valid_stem_line_indices.size());
+
+	for(int i=0; i<valid_stem_line_indices.size(); i++) {
+
+		rgb = std::max(rand()%255, 50) << 16 | std::max(rand()%255, 50) << 8 | std::max(rand()%255, 50);
+
+		random_color_for_stems[i] = *reinterpret_cast<float*>(&rgb);
+	}
+#endif
+
+
+#if 0
+	for(int i=0; i<segment_vec.size(); i++) {
+
+		if(stem_id_for_segment[i] == -1) 
+			continue;
+
+		for(auto & v : segment_vec[i])
+			for(auto & index : mst[v].cluster_indices) 
+				filtered_cloud->points[index].rgb = random_color_for_stems[stem_id_for_segment[i]];
+	}	
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+#endif
+
+	// break connection of broken leaves
+	seg_idx = 0;
+
+	rgb = 255;
+
+	std::vector<sv_vertex_t> vertices_to_clear;
+
+	for(auto & segment : segment_vec) {
+
+		bool contain_stem = false;
+
+		for(auto & v : segment) {
+	
+			if(stem_inlier_map[v] != -1) {
+
+				contain_stem = true;
+				break;
+			}
+		}
+
+		if(contain_stem) {
+		
+			++seg_idx;
+			continue;
+		}
+
+		const int front_degree = boost::out_degree(segment.front(), mst);
+
+		const int back_degree = boost::out_degree(segment.back(), mst);
+
+		if( front_degree == 1 && back_degree == 2 ) {
+
+			Eigen::Vector3f end_point = filtered_cloud->points[mst[segment.front()].index].getVector3fMap();
+
+			Eigen::Vector3f connect_point = filtered_cloud->points[mst[segment.back()].index].getVector3fMap();
+
+			if( end_point(0) > connect_point(0) || first_node_end_map[seg_idx])
+				vertices_to_clear.push_back(segment.back());
+			
+		//	for(auto & v : segment) 
+		//		for(auto & i : mst[v].cluster_indices)
+		//				filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+		}
+		else if( front_degree == 2 && back_degree == 1 ) {
+
+			Eigen::Vector3f end_point = filtered_cloud->points[mst[segment.back()].index].getVector3fMap();
+
+			Eigen::Vector3f connect_point = filtered_cloud->points[mst[segment.front()].index].getVector3fMap();
+
+			if( end_point(0) > connect_point(0) || !first_node_end_map[seg_idx])
+				vertices_to_clear.push_back(segment.front());
+
+		}	
+
+		++seg_idx;
+	}
+
+	for(auto iter = vertices_to_clear.begin(); iter!= vertices_to_clear.end(); ++iter)
+		boost::clear_vertex(*iter, mst);
+
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+		int s_idx = mst[boost::source(e, mst)].index;
+
+		int t_idx = mst[boost::target(e, mst)].index;
+
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+
+	for(auto & stem_line_id : valid_stem_line_indices) {
+
+		PointT p0, p1;
+	
+		p0.getVector3fMap() = a_vec[stem_line_id];
+
+		p1.getVector3fMap() = a_vec[stem_line_id] + line_len*b_vec[stem_line_id];
+
+		viewer->addLine(p0, p1, 1, 0, 0, "line"+to_string(cv::getTickCount()));
+	}
+
+
+	std::vector<int> cc(boost::num_vertices(mst));
+	
+	int num = boost::connected_components(mst, &cc[0]);
+
+
+	// find plant orientation
+	std::vector<Eigen::Vector3f> plant_plane_normals(valid_stem_line_indices.size());
+
+	for(auto & stem_line_index : valid_stem_line_indices) {
+
+		point_indices->indices.clear();
+
+		Eigen::Vector3f & base_point = a_vec[stem_line_index];
+		Eigen::Vector3f & line_dir = b_vec[stem_line_index];
+
+		BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+			Eigen::Vector3f vector = filtered_cloud->points[mst[v].index].getVector3fMap() - base_point;
+
+			float point_to_line_dist = (vector - vector.dot(line_dir)*line_dir).norm();
+
+			if(point_to_line_dist < 0.1f) {
+
+				point_indices->indices.push_back(mst[v].index);
+			}
+		}
+
+		pca.setIndices(point_indices);
+
+		Eigen::Vector3f middle_vector = pca.getEigenVectors().col(1);
+
+		plant_plane_normals.push_back(middle_vector);
+
+		PointT p0; p0.getVector3fMap() = base_point;
+
+		PointT p1; p1.getVector3fMap() = base_point+0.1f*middle_vector;
+
+		viewer->addLine(p0, p1, 1,1,0, "line"+to_string(cv::getTickCount()));
+	}
+
+
+#if 1
+	// leaf segmentation
+	std::vector<bool> leaf_map(segment_vec.size(), false);
+
+	seg_idx = 0;
+
+	float stem_radius = 0.03f;
+
+	rgb = 255<<16 | 255<<8 | 0;	
+
+	for(auto & segment : segment_vec) {
+
+		if(stem_id_for_segment[seg_idx] == -1) {
+
+			++seg_idx;
+			continue;
+		}
+
+		bool segment_connected_to_stem = false;
+
+		BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+			if( stem_inlier_map[v] != -1 && cc[v] == cc[segment.front()] ) {
+
+				segment_connected_to_stem = true;
+				break;
+			}
+		}
+
+		if(!segment_connected_to_stem) {
+
+			++seg_idx;
+			continue;
+		}
+
+		if(stem_inlier_map[segment.front()] != -1 && stem_inlier_map[segment.back()] != -1) {
+
+			++seg_idx;
+			continue;
+		}
+		
+
+		const int stem_line_index = stem_id_for_segment[seg_idx];
+	
+		point_indices->indices.clear();
+
+		for(auto & v : segment) 
+			if( stem_inlier_map[v] == -1 ) 
+				point_indices->indices.insert(point_indices->indices.end(), mst[v].cluster_indices.begin(), mst[v].cluster_indices.end());
+				//point_indices->indices.push_back(mst[v].index);
+		
+		if( point_indices->indices.size() < 3 ) {
+
+			++seg_idx;
+			continue;
+		}
+
+		for(auto & i : point_indices->indices) filtered_cloud->points[i].rgb = rgb;
+
+		Eigen::Vector3f & base_point = a_vec[stem_line_index];
+
+		Eigen::Vector3f & line_dir = b_vec[stem_line_index];
+			
+		pca.setIndices(point_indices);
+
+		Eigen::Vector3f major_vector = pca.getEigenVectors().col(0);
+
+		Eigen::Vector3f mean = pca.getMean().head(3);
+
+		Eigen::Vector3f vector = mean - base_point;
+
+		float point_to_line_dist = (vector - vector.dot(line_dir)*line_dir).norm();
+
+		float abs_cosine = std::abs(major_vector.dot(line_dir));
+
+		if ( point_to_line_dist > stem_radius
+		     && abs_cosine < 0.99f 	
+		) {
+
+			for(auto & i : point_indices->indices) filtered_cloud->points[i].rgb = rgb*0.5f;
+
+			leaf_map[seg_idx] = true;
+
+			//measure leaf angle
+
+			point_indices->indices.clear();
+			
+			for(auto & v : segment) {
+
+				vector = filtered_cloud->points[mst[v].index].getVector3fMap() - base_point;
+
+				point_to_line_dist = (vector - vector.dot(line_dir)*line_dir).norm();
+
+				if( point_to_line_dist < 0.1f && stem_inlier_map[v] == -1 )
+					point_indices->indices.push_back(mst[v].index);
+			}
+
+			if(point_indices->indices.size() > 2) {
+
+				pca.setIndices(point_indices);
+
+				major_vector = pca.getEigenVectors().col(0);
+
+				mean = pca.getMean().head(3);
+
+				if(major_vector(0) > 0.f) major_vector *= -1.0f;
+
+				abs_cosine = std::abs(major_vector.dot(line_dir));
+
+				float line_to_line_dist = std::abs( (mean-base_point).dot(line_dir.cross(major_vector)) ) / (line_dir.cross(major_vector)).norm();
+
+				if( line_to_line_dist < stem_radius ) 
+				{
+
+					int start_v = -1;
+
+					if( first_node_end_map[seg_idx] ) {
+
+						for(auto iter=segment.begin(); iter != segment.end(); ++iter) {
+
+							if( stem_inlier_map[*iter] != -1 )
+								continue;
+
+							start_v = *iter;
+					
+							break;
+						}
+					}
+					else {
+						for(auto iter=segment.rbegin(); iter != segment.rend(); ++iter) {
+
+							if( stem_inlier_map[*iter] != -1 )
+								continue;
+
+							start_v = *iter;
+					
+							break;
+						}
+					}
+
+					if(start_v != -1) {
+
+						PointT start_point = filtered_cloud->points[mst[start_v].index];
+
+						PointT end_point; end_point.getVector3fMap() = start_point.getVector3fMap() + line_dir*0.05f;
+
+						float rgb_f = shortRainbowColorMap(1.f - abs_cosine, 1.0f-0.99f, 1.0f-0.6f);
+
+						uint32_t rgb_int = *reinterpret_cast<uint32_t*>(&rgb_f);
+
+						float r = ((unsigned char)(rgb_int >> 16))/255.f;
+						float g = ((unsigned char)(rgb_int >> 8))/255.f;
+						float b = ((unsigned char)(rgb_int))/255.f;
+
+						viewer->addLine( start_point, end_point, r, g, b, "line"+to_string(cv::getTickCount()));
+
+						end_point.getVector3fMap() = start_point.getVector3fMap() + major_vector*0.1f;
+
+						viewer->addLine( start_point, end_point, r, g, b, "line"+to_string(cv::getTickCount()));
+
+						//float angle = acos(abs_cosine)/M_PI*180.f;	//0~90 degrees
+					}
+				}
+			}
+
+//			for(auto & v : segment)	for(auto & index : mst[v].cluster_indices) filtered_cloud->points[index].rgb = random_color_for_stems[stem_id_for_segment[seg_idx]];
+		}
+
+		++seg_idx;
+	}
+
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+#endif
+
+
+
+#if 0
+	// break nonlinear segments
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+	//viewer->spin();
+
+
+	std::vector<std::pair<int, int>> segment_to_break_indices;	//with index of the breaking node
+
+	pcl::PCA<PointT> pca;
+
+	pca.setInputCloud(filtered_cloud);
+
+	pcl::PointIndices::Ptr point_indices(new pcl::PointIndices);
+
+	pcl::PointIndices::Ptr point_indices_complement(new pcl::PointIndices);
+
+	int seg_idx = 0;
+
+	for(auto & segment : segment_vec) {
+
+		if( segment.size() > 20 ) {
+
+			int break_idx = -1;
+			float min_total_curvature = 2.f;
+
+			for(int ni=4; ni<segment.size()-4; ni++) {
+
+				point_indices->indices.resize(ni);
+
+				point_indices_complement->indices.resize(segment.size() - ni);
+
+				for(int j=0; j<ni; j++) 
+					point_indices->indices[j] = mst[segment[j]].index;
+
+				for(int j=0; j<point_indices_complement->indices.size(); j++) 
+					point_indices_complement->indices[j] = mst[segment[j+ni]].index;
+
+				pca.setIndices(point_indices);
+
+				Eigen::Vector3f first = pca.getEigenValues().head(3);
+				
+				pca.setIndices(point_indices_complement);
+
+				Eigen::Vector3f second = pca.getEigenValues().head(3);
+
+				float tmp_total_curvature = first(0)/first.sum() + second(0)/second.sum();
+
+				if( tmp_total_curvature < min_total_curvature ) {
+
+					min_total_curvature = tmp_total_curvature;
+
+					break_idx = ni;
+				}
+			}
+
+			cout<<"min_total_curvature "<<min_total_curvature<<"\n";
+
+			if(break_idx != -1 && min_total_curvature < 1.8) {
+
+				segment_to_break_indices.push_back(std::make_pair(seg_idx, break_idx));
+
+				boost::clear_vertex(segment[break_idx], mst);
+			}
+		}
+
+		++seg_idx;
+	}
+
+	viewer->removeAllShapes();
+
+	BGL_FORALL_EDGES(e, mst, sv_graph_t) {
+
+		int s_idx = mst[boost::source(e, mst)].index;
+
+		int t_idx = mst[boost::target(e, mst)].index;
+
+		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
+	}
+
+	
+	for(auto & pair : segment_to_break_indices) {
+
+		const int seg_idx = pair.first;
+		const int break_idx = pair.second;
+
+		std::vector<sv_vertex_t> new_segment;
+
+		new_segment.insert(new_segment.end(), segment_vec[seg_idx].begin()+break_idx, segment_vec[seg_idx].end());
+
+		segment_vec.push_back(new_segment);
+
+		segment_vec[seg_idx].erase(segment_vec[seg_idx].begin()+break_idx, segment_vec[seg_idx].end());
+	}
+#endif
+
+
+#if 0
+	// classify segments to good leaf, stem, or garbage
+	std::vector<int> stem_segment_indices;
+
+	int idx = 0;
+
+	for(auto & segment : segment_vec) {
+
+		if( segment.size() < 2*min_branch_size ) {
+
+			idx++;
+			continue;
+		}
+
+		point_indices->indices.resize(segment.size());
+
+		for(int i=0; i<segment.size(); i++) point_indices->indices[i] = mst[segment[i]].index;
+
+		pca.setIndices(point_indices);
+
+#if 0
+		Eigen::Vector3f eigen_values = pca.getEigenValues();
+
+		float linearity = (eigen_values(0)-eigen_values(1))/eigen_values(0);
+
+		cout<<"linearity "<< linearity<<"\n";
+
+		if( linearity < min_linearity ) {
+
+			uint32_t rgb = 255 << 16 | 255 << 8 | 255;
+
+			for(auto & v : segment) {
+
+				for(auto & index : mst[v].cluster_indices)
+					filtered_cloud->points[index].rgb = *reinterpret_cast<float*> (&rgb);
+			}
+
+#if 0
+			PointCloudT::Ptr segment_cloud(new PointCloudT);
+
+			pcl::copyPointCloud(*filtered_cloud, point_indices, *segment_cloud);
+
+			std::vector<Eigen::Vector3f> point_vec, vector_vec;
+
+			cout<<"segment cloud size " << segment_cloud->size()<<"\n";
+			
+			Hough3DLine(segment_cloud, viewer, point_vec, vector_vec, 0.02, 2, 5, 5);
+
+			cout<<point_vec.size()<<"\n";
+
+			if( point_vec.size() == 2 ) {
+			
+				for(int i=0; i<2; i++) {
+
+					pcl::PointXYZ p1(point_vec[i](0), point_vec[i](1), point_vec[i](2));	
+
+					Eigen::Vector3f vector = point_vec[i] + line_len*vector_vec[i];
+
+					pcl::PointXYZ p2(vector(0), vector(1), vector(2));
+
+					viewer->addLine(p1, p2, 0, 0, 1, "line"+to_string(cv::getTickCount()));	
+				}
+			}
+#endif
+			
+		}
+#endif
+	
+
+		Eigen::Vector3f major_eigen_vector = pca.getEigenVectors().col(0);
+
+		Eigen::Vector3f mean = pca.getMean().head(3);
+
+		for(auto & stem_line_index: valid_stem_line_indices) {
+
+			Eigen::Vector3f base_to_centroid = mean - a_vec[stem_line_index];
+
+			const float centroid_to_stem_line_dist = (base_to_centroid - base_to_centroid.dot(b_vec[stem_line_index])*b_vec[stem_line_index]).norm();
+		
+			if( centroid_to_stem_line_dist < 0.1f /* && std::abs(major_eigen_vector.dot(b_vec[stem_line_index])) > 0.9*/) {
+
+
+				
+		
+				stem_segment_indices.push_back(idx);
+			
+				break;
+			}
+		}
+
+		idx++;
+	}
+	
+
+	rgb = 255 << 16 | 255 << 8 | 0;
+
+	for(auto & segment_id : stem_segment_indices)
+		for(auto & v : segment_vec[segment_id])
+			for(auto & i : mst[v].cluster_indices) 
+				filtered_cloud->points[i].rgb = *reinterpret_cast<float*> (&rgb);
+
+	viewer->updatePointCloud(filtered_cloud, "slice cloud");
+	
+#endif	
+
+	viewer->spin();
+
+}
+
+
+void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer) {
+
 	if(cloud->size() < 100) return;
 
 	pcl::SupervoxelClustering<PointT> super(voxel_resolution, seed_resolution);
@@ -810,14 +2396,14 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 
 	super.getSupervoxelAdjacencyList(supervoxel_adjacency_list);
 
-	//PointLCloudT::Ptr color_cloud = super.getLabeledCloud();
+	PointLCloudT::Ptr color_cloud = super.getLabeledCloud();
 
 	sv_graph_t sv_graph;
 
 	std::map<uint32_t, sv_vertex_t> label_ID_map;
 
-	BGL_FORALL_VERTICES(vertex, supervoxel_adjacency_list, Graph)
-	{
+	BGL_FORALL_VERTICES(vertex, supervoxel_adjacency_list, Graph) {
+
 		sv_vertex_t v = boost::add_vertex(sv_graph);
 
 		sv_graph[v].supervoxel_label = supervoxel_adjacency_list[vertex];
@@ -827,8 +2413,8 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 		label_ID_map.insert(std::make_pair(supervoxel_adjacency_list[vertex], v));
 	}
 
-	BGL_FORALL_EDGES(edge, supervoxel_adjacency_list, Graph)
-	{
+	BGL_FORALL_EDGES(edge, supervoxel_adjacency_list, Graph) {
+
 		Voxel s = boost::source(edge, supervoxel_adjacency_list);
 		Voxel t = boost::target(edge, supervoxel_adjacency_list);
 
@@ -843,19 +2429,18 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 
 		boost::tie(sv_edge, edge_added) = boost::add_edge(sv_s, sv_t, sv_graph);
 
-		if(edge_added)
-		{
+		if(edge_added) {
+
 			pcl::Supervoxel<PointT>::Ptr svs = supervoxel_clusters.at(s_l);
 			pcl::Supervoxel<PointT>::Ptr svt = supervoxel_clusters.at(t_l);
 
 			sv_graph[sv_edge].weight = supervoxel_adjacency_list[edge];//*( 1.0f- std::abs(dir(0)) );
 		}
-
 	}
 
 
-	BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t)
-	{
+	BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t) {
+
 		sv_vertex_t s = boost::source(edge, sv_graph);
 		sv_vertex_t t = boost::target(edge, sv_graph);
 		
@@ -928,24 +2513,123 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 
 	int num_v = boost::num_vertices(sv_graph);
 
-	Eigen::MatrixXf W = Eigen::MatrixXf::Constant(num_v, num_v, 0);
+	Eigen::MatrixXf L = Eigen::MatrixXf::Constant(num_v, num_v, 0.f);
 
-	Eigen::MatrixXf D = Eigen::MatrixXf::Constant(num_v, num_v, 0);
+	BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t) {
 
-	BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t)
-	{
 		int s = boost::source(edge, sv_graph);
 		int t = boost::target(edge, sv_graph);
 
-		const float weight = 1.0f;//exp(-sv_graph[edge].weight);
+		//Eigen::Vector3f vector = (sv_graph[t].supervoxel->centroid_.getVector3fMap() - sv_graph[s].supervoxel->centroid_.getVector3fMap());
 
-		W(s, t) = W(t, s) = weight;
+		const float weight = exp(-sv_graph[edge].weight);
 
-		D(t, t) += weight;
-		D(s, s) += weight;
+		L(s, t) = L(t, s) = -1.0f;//-weight;
 	}
 
-	Eigen::MatrixXf L = D - W;
+	cout<<"\n";
+
+	for(int i=0; i<num_v; i++) L(i, i) = -1.0f*L.col(i).sum();
+
+	viewer->addPointCloud(color_cloud, "color_cloud");
+	viewer->spin();
+
+	// AX=B initialization
+	const float sl = 3.0f;
+	const float S0 = seed_resolution;
+	float St = S0;
+
+	Eigen::MatrixXf A = Eigen::MatrixXf::Constant( 2*num_v, num_v, 0.f );	
+
+	Eigen::MatrixXf B = Eigen::MatrixXf::Constant( 2*num_v, 3, 0.f );
+
+	Eigen::VectorXf WL_diag_vec = Eigen::VectorXf::Constant( num_v, 0.5f);///(40*S0) );
+
+	for(int i=0; i<num_v; i++) WL_diag_vec(i) *= /*boost::out_degree(i, sv_graph) < 2 ? 0.0f :*/ (float)boost::out_degree(i, sv_graph);
+	
+
+	Eigen::VectorXf WH0_diag_vec = Eigen::VectorXf::Constant( num_v, 1.f );
+
+	Eigen::VectorXf WHt_diag_vec = WH0_diag_vec;
+
+	Eigen::VectorXf St_vec = Eigen::VectorXf::Constant( num_v, S0);
+
+	Eigen::MatrixXf P = Eigen::MatrixXf::Constant( num_v, 3, 0.f);
+
+	Eigen::MatrixXf P_new = Eigen::MatrixXf::Constant( num_v, 3, 0.f);
+
+	// supervoxel centroid coordinates to eigen matrix form
+	for(int i=0; i<num_v; i++) P.row(i) = sv_graph[i].supervoxel->centroid_.getVector3fMap().transpose();
+
+	for(int iter=0; iter<1; iter++) {
+
+		A.block(num_v, 0, num_v, num_v) = WHt_diag_vec.asDiagonal();
+
+		A.block(0, 0, num_v, num_v) = WL_diag_vec.asDiagonal()*L;
+
+		B.block(num_v, 0, num_v, 3) = WHt_diag_vec.asDiagonal()*P;
+
+		//P_new = A.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(B);
+
+		P_new = A.fullPivHouseholderQr().solve(B);
+
+		cout<<"compute done\n";
+
+		viewer->removeAllShapes();
+
+/*		for(int i=0; i<num_v; i++) {
+
+			PointAT p ;
+		
+			p.getVector3fMap() = P_new.row(i).transpose();
+
+			
+			viewer->addLine(sv_graph[i].supervoxel->centroid_, p, 1, 1, 1, "line"+std::to_string(cv::getTickCount()), 0);
+		}
+*/
+		for(int i=0; i<num_v; i++) {
+
+			sv_graph[i].supervoxel->centroid_.getVector3fMap() = P_new.row(i).transpose();
+		}
+		
+
+		BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t) {
+
+			sv_vertex_t s = boost::source(edge, sv_graph);
+			sv_vertex_t t = boost::target(edge, sv_graph);
+		
+			viewer->addLine(sv_graph[s].supervoxel->centroid_, sv_graph[t].supervoxel->centroid_, 1, 1, 1, "line"+std::to_string(cv::getTickCount()), 0);
+		}
+
+		viewer->spin();
+		//viewer->removeAllPointClouds();
+
+		// update weight matrices
+		WL_diag_vec *= sl;
+		
+		for(int v=0; v<num_v; v++) {
+		
+			
+			float min_dist = 1e10f;
+	
+			BGL_FORALL_ADJ(v, adj, sv_graph, sv_graph_t) {
+				
+				float dist = (P_new.row(v) - P_new.row(adj)).norm();
+	
+				if(dist < min_dist) min_dist = dist;
+			}
+
+			if(min_dist < 1e10f && min_dist > 1e-5f) St_vec(v) = S0 / min_dist;
+		}
+
+		WHt_diag_vec = WH0_diag_vec.cwiseProduct(St_vec);
+
+		P = P_new;
+	}
+
+	return;
+	
+
 
 	// ... and its eigenvalues and eigenvectors
 	Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> eig(L);
@@ -953,6 +2637,7 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 	Eigen::VectorXf eigenvalues = eig.eigenvalues();
 
 	PointCloudT::Ptr spectral_cloud(new PointCloudT);
+
 
 	int nonzero_eigen_idx = 0;
 
@@ -963,9 +2648,14 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 			nonzero_eigen_idx = i;
 			break;
 		}
-	} 	
+	} 
 
+	if ( nonzero_eigen_idx > 0 )
+		cout<<eigenvalues(nonzero_eigen_idx-1)<<" ";
 
+	cout<<eigenvalues(nonzero_eigen_idx)<<" "<<eigenvalues(nonzero_eigen_idx+1)<<"\n";
+
+#if 1	
 	for(int f=nonzero_eigen_idx; f<num_v; f++)
 	{
 		Eigen::VectorXf v = eigvecs.col(f);
@@ -1000,10 +2690,10 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 
 			spectral_cloud->push_back(p);
 
-viewer->removeAllPointClouds();
-viewer->addPointCloud(spectral_cloud, "sc");
-viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 8.0, "sc");
-viewer->spin();
+			viewer->removeAllPointClouds();
+			viewer->addPointCloud(spectral_cloud, "sc");
+			viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 8.0, "sc");
+			viewer->spin();
 			
 		}
 
@@ -1013,44 +2703,45 @@ viewer->spin();
 	}
 
 	return;
+#endif
 
-	for(int i=0; i<num_v; i++)		
-	{
+	for(int i=0; i<num_v; i++) {
+
 		PointT p;
-		p.x = eigvecs(i, 1);
-		p.y = eigvecs(i, 2);
-		p.z = eigvecs(i, 3);
+		p.getVector3fMap() = eigvecs.block(i, nonzero_eigen_idx, 1, 3).transpose();
+
+//		p.x /= std::sqrt(eigenvalues(nonzero_eigen_idx));
+//		p.y /= std::sqrt(eigenvalues(nonzero_eigen_idx+1));
+//		p.z /= std::sqrt(eigenvalues(nonzero_eigen_idx+2));
+
 		p.r = p.g = p.b = 255;
+//		p.rgb = 
 
 		spectral_cloud->push_back(p);
 
-		pcl::Supervoxel<PointT>::Ptr sv = supervoxel_clusters.at(sv_graph[i].supervoxel_label);
-
 		PointT p1;
-		p1.x = sv->centroid_.x;
-		p1.y = sv->centroid_.y;
-		p1.z = sv->centroid_.z;
+		pcl::copyPoint(sv_graph[i].supervoxel->centroid_, p1);
 
 		viewer->addLine(p1, p, "c"+to_string(i));
-		
+
+		viewer->spin();		
 	}
 
 	viewer->addPointCloud(spectral_cloud, "spectral");
-
 
 	viewer->spin();
 
 	viewer->removePointCloud("spectral");
 	viewer->removeAllShapes();
-
 }
 
 
-void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool color_hist_equalization = true)
+void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, float min_z = 0.5f, float max_z = 3.0f, bool color_hist_equalization = true)
 {
-	cloud->points.clear();
+	cloud->clear();
 
 	// BGRD is flipped horizontally
+#if 1
 	BGRD tmp_bgrd;
 	for(int y=0; y<depth_height; y++)
 	{
@@ -1063,6 +2754,7 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool c
 			*ptr2 = tmp_bgrd;
 		}
 	}
+#endif
 
 	cv::Mat img_hist_equalized; 
 
@@ -1081,7 +2773,7 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool c
 			}
 		}
 
-		cv::imshow("color"+std::to_string(cv::getTickCount()),color); cv::waitKey(0);
+		cv::imshow("color"/*+std::to_string(cv::getTickCount())*/, color); cv::waitKey(50);
 
 		std::vector<cv::Mat> channels; 
 
@@ -1127,7 +2819,7 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool c
 	}
 #endif		
 
-#if 0
+#if 1
 	cv::Mat depth_cv;
 	cv::Mat depth_u16; 
 	depth_cv.create(depth_height, depth_width, CV_8U);
@@ -1140,15 +2832,15 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool c
 	cv::transpose(depth_u16, depth_u16);
 	cv::flip(depth_u16, depth_u16, 1);
 
-	cv::Mat binary;
-	binary = depth_u16 < 1524;
+//	cv::Mat binary;
+//	binary = depth_u16 < 1524;
 	
-	cv::imshow("binary", binary);
+//	cv::imshow("binary", binary);
 
 	cv::imshow("cur_depth", depth_cv); 
 //	cv::imshow("pre_depth", pre_depth_cv);
 //	cv::imshow("pre_pre_depth", pre_pre_depth_cv);
-	cv::waitKey(0);
+	cv::waitKey(100);
 //	pre_depth_cv.copyTo(pre_pre_depth_cv);
 //	depth_cv.copyTo(pre_depth_cv);
 #endif
@@ -1162,7 +2854,7 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, bool c
 
 			p.z = ptr->d*0.001f;
 
-			if(p.z > 1.524f || p.z < 0.5f) continue;
+			if(p.z > max_z || p.z < min_z) continue;
 
 			if(color_hist_equalization)
 			{
@@ -1361,12 +3053,13 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 	*plant_cloud += *cloud_cam;
 
+	uint32_t rgb = 100<<16 | 100<<8 | 100;
 	for(auto & p : soil_cloud->points)
-		p.r = p.g = p.b = 100;
-
-	cout<<"plant cloud size "<<plant_cloud->size()<<"\n";
+		p.rgb = *reinterpret_cast<float*>(&rgb);
 
 	if(plant_cloud->size() < 2000) return true;
+
+
 
 
 #if 1
@@ -1376,6 +3069,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	sor.setStddevMulThresh (sor_std);
 	sor.filter (*tmp_cloud);
 
+	viewer->removeAllShapes(); skeleton(tmp_cloud, Eigen::Vector3f (0,0,0), Eigen::Vector3f (1, 0, 0), viewer); return true;
+
 //	*tmp_cloud = *plant_cloud;
 
 	// Create a KD-Tree
@@ -1384,6 +3079,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	// Output has the PointNormal type in order to store the normals calculated by MLS
 	pcl::PointCloud<PointT> mls_points;
 
+	pcl::console::TicToc tt;
+	tt.tic();
 	// Init object (second point type is for the normals, even if unused)
 	pcl::MovingLeastSquares<PointT, PointT> mls;
 
@@ -1398,145 +3095,16 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	// Reconstruct
 	mls.process(mls_points);
 
+	tt.toc_print();
+
+	cout<<"mls input size "<<tmp_cloud->size()<<"\n";
+
 	std::vector<int> indices;
 	pcl::removeNaNFromPointCloud(mls_points, indices);
 
 	cout<<"nan size: "<<mls_points.size()-indices.size()<<"\n";
 
 	pcl::copyPointCloud(mls_points, *tmp_cloud);
-
-	// convexity feature test
-#if 0
-	pcl::SupervoxelClustering<PointT> super(voxel_resolution, seed_resolution);
-	super.setInputCloud(tmp_cloud);
-	super.setColorImportance (color_importance);
-	super.setSpatialImportance (spatial_importance);
-	super.setNormalImportance (normal_importance);
-
-	std::map<uint32_t, pcl::Supervoxel<PointT>::Ptr> supervoxel_clusters;
-
-	super.extract(supervoxel_clusters);
-
-	if(supervoxel_clusters.size() <= 100) return true;
-
-	PointLCloudT::Ptr labeled_cloud = super.getLabeledCloud();
-
-	//viewer->addPointCloud(labeled_cloud, "label");
-
-	Graph pcl_sv_graph;
-
-	super.getSupervoxelAdjacencyList(pcl_sv_graph);
-
-	sv_graph_t sv_graph;
-
-	std::map<uint32_t, sv_vertex_t> label_ID_map;
-
-	BGL_FORALL_VERTICES(vertex, pcl_sv_graph, Graph)
-	{
-		sv_vertex_t v = boost::add_vertex(sv_graph);
-
-		sv_graph[v].supervoxel_label = pcl_sv_graph[vertex];
-		sv_graph[v].convexity = 0.f;
-
-		label_ID_map.insert(std::make_pair(pcl_sv_graph[vertex], v));
-	}
-
-	BGL_FORALL_EDGES(edge, pcl_sv_graph, Graph)
-	{
-		Voxel s = boost::source(edge, pcl_sv_graph);
-		Voxel t = boost::target(edge, pcl_sv_graph);
-
-		uint32_t s_l = pcl_sv_graph[s];
-		uint32_t t_l = pcl_sv_graph[t];
-
-		sv_vertex_t sv_s = (label_ID_map.find(s_l))->second;
-		sv_vertex_t sv_t = (label_ID_map.find(t_l))->second;
-
-		sv_edge_t sv_edge;
-		bool edge_added;
-
-		boost::tie(sv_edge, edge_added) = boost::add_edge(sv_s, sv_t, sv_graph);
-
-		if(edge_added)
-		{
-			//pcl::Supervoxel<PointT>::Ptr svs = supervoxel_clusters.at(s_l);
-			//pcl::Supervoxel<PointT>::Ptr svt = supervoxel_clusters.at(t_l);
-
-			sv_graph[sv_edge].weight = pcl_sv_graph[edge];//*( 1.0f- std::abs(dir(0)) );
-		}
-	}
-
-	BGL_FORALL_VERTICES(vertex, sv_graph, sv_graph_t)
-	{
-		PointCloudT::Ptr one_ring_cloud(new PointCloudT);
-
-		pcl::Supervoxel<PointT>::Ptr sv = supervoxel_clusters.at(sv_graph[vertex].supervoxel_label);
-
-		*one_ring_cloud += *sv->voxels_;
-
-		BGL_FORALL_ADJ(vertex, adj_v, sv_graph, sv_graph_t)
-		{
-			pcl::Supervoxel<PointT>::Ptr adj_sv = supervoxel_clusters.at(sv_graph[adj_v].supervoxel_label);
-			
-			*one_ring_cloud += *adj_sv->voxels_;			
-		}
-
-		if(one_ring_cloud->size() < 10 ) continue;
-
-		pcl::VoxelGrid<PointT> vox;
-		vox.setLeafSize(voxel_resolution,voxel_resolution,voxel_resolution);
-		vox.setInputCloud(one_ring_cloud);
-		PointCloudT::Ptr filtered_cloud(new PointCloudT);
-		vox.filter(*filtered_cloud);
-
-
-		pcl::ConvexHull<PointT> chull;
-		chull.setDimension(3);
-		chull.setComputeAreaVolume(true);
-
-		chull.setInputCloud (filtered_cloud);	
-
-		std::vector<pcl::Vertices> vertices_chull;
-		PointCloudT::Ptr cloud_hull(new PointCloudT);
-
-		chull.reconstruct (*cloud_hull, vertices_chull);
-
-		double H = std::pow(voxel_resolution, 3.0)*filtered_cloud->size()/chull.getTotalVolume();
-
-		sv_graph[vertex].convexity = H;
-
-		cout<<"H "<<H<<"\n";
-
-		for(auto & p : sv->voxels_->points)
-		{
-			p.r = p.g = p.b = (unsigned char)std::min(H/1.5*255, 255.);
-		}		
-		
-		//double area = chull.getTotalArea();
-
-
-		if(H > 1.)
-		{
-		viewer->addPolygonMesh<PointT>(cloud_hull, vertices_chull, "convex hull"+std::to_string(cv::getTickCount()));
-
-		viewer->addPointCloud(filtered_cloud, "ring"+to_string(cv::getTickCount()));
-
-		viewer->spin();
-
-		viewer->removeAllPointClouds();
-		viewer->removeAllShapes();
-		}
-
-	}
-
-	viewer->spin();
-
-	viewer->removeAllPointClouds();
-	viewer->removeAllShapes();
-
-	return true;
-#endif
-
 
 	pcl::search::Search<PointT>::Ptr tree = boost::shared_ptr<pcl::search::Search<PointT>> (new pcl::search::KdTree<PointT>);
 	NormalCloudT::Ptr normals(new NormalCloudT);
@@ -1571,7 +3139,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 	PointCloudT::Ptr colored_cloud = reg.getColoredCloud ();
 
-	//viewer->addPointCloud(colored_cloud,"color", 0);
+	viewer->addPointCloud(colored_cloud,"color", 0);
 	//viewer->spin();
 	//viewer->removeAllPointClouds();
 
@@ -1587,30 +3155,6 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 		//*init_stem_cloud += *rr_segment_cloud;
 		
-
-/*		pcl::octree::OctreePointCloud<PointT> octree(vox_size);
-		octree.setInputCloud(rr_segment_cloud);
-		octree.addPointsFromInputCloud();
-
-		std::vector<PointT, Eigen::aligned_allocator<PointT> > voxelCenters;
-  		int num_voxels = octree.getOccupiedVoxelCenters (voxelCenters);
-
-		pcl::ConvexHull<PointT> chull;
-		chull.setDimension(3);
-		chull.setComputeAreaVolume(true);
-
-		chull.setInputCloud (rr_segment_cloud);	
-
-		std::vector<pcl::Vertices> vertices_chull;
-		PointCloudT::Ptr cloud_hull(new PointCloudT);
-
-		chull.reconstruct (*cloud_hull, vertices_chull);
-
-		double H = std::pow(vox_size, 3.0)*rr_segment_cloud->size()/chull.getTotalVolume();
-*/
-		//cout<<H<<"\n";
-
-		//if(H > 1.) continue;
 
 #if 1
 /*		pcl::SupervoxelClustering<PointT> super(voxel_resolution, seed_resolution);
@@ -1770,8 +3314,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	{
 		bool valid_line = true;
 
-		//check root position
-		if( a_vec[i](2) > 1.3f || a_vec[i](2) < 0.7f) valid_line = false;
+		//check root position and line direction
+		if( a_vec[i](2) > 1.3f || a_vec[i](2) < 0.7f || b_vec[i](0) > -0.95) valid_line = false;
 		
 		for (int j=0; valid_line && j<i; j++)		
 		{
@@ -1786,18 +3330,20 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 			}
 		}
 
+		pcl::PointXYZ p1(a_vec[i](0), a_vec[i](1), a_vec[i](2));
+
+		Eigen::Vector3f vector = a_vec[i] + line_len*b_vec[i];
+
+		pcl::PointXYZ p2(vector(0), vector(1), vector(2));
+
 		if(!valid_line)
 		{
-			pcl::PointXYZ p1(a_vec[i](0), a_vec[i](1), a_vec[i](2));
-
-			Eigen::Vector3f vector = a_vec[i] + line_len*b_vec[i];
-
-			pcl::PointXYZ p2(vector(0), vector(1), vector(2));
-
 			viewer->addLine(p1, p2, 0, 1, 0, "line"+to_string(cv::getTickCount()));	
 
 			continue;
 		}		
+		else 
+			viewer->addLine(p1, p2, 1, 0, 0, "line"+to_string(cv::getTickCount()));	
 
 		Eigen::VectorXf line_eigen(6);
 		line_eigen(0) = a_vec[i](0); line_eigen(1) = a_vec[i](1); line_eigen(2) = a_vec[i](2);
@@ -1814,13 +3360,10 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 			colored_cloud->points[idx].b = 255;  
 		}	
 
-		pcl::PointXYZ p1(a_vec[i](0), a_vec[i](1), a_vec[i](2));
+		viewer->spin();
 
-		Eigen::Vector3f vector = a_vec[i] + line_len*b_vec[i];
-
-		pcl::PointXYZ p2(vector(0), vector(1), vector(2));
-
-		//viewer->spin();
+		continue;
+		
 
 
 		PointCloudT::Ptr super_cloud_in(new PointCloudT);
@@ -1830,8 +3373,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 		cout<<"super_cloud_in size "<<super_cloud_in->size()<<"\n";
 
 
-	//	viewer->removeAllShapes();
-	//	spectralCluster(super_cloud_in, viewer);	continue;
+		viewer->removeAllShapes(); skeleton(super_cloud_in, a_vec[i], b_vec[i], viewer); continue;
 
 	/*	ofstream myfile;
 		myfile.open ("cloud.off");
@@ -1848,12 +3390,11 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 		Graph supervoxel_adjacency_list;
 
 		// my supervoxel graph
-		sv_graph_t sv_graph;
+		sv_graph_t sv_graph, sv_graph_origional;
 
 		std::map<uint32_t, pcl::Supervoxel<PointT>::Ptr> supervoxel_clusters;
 
-
-		viewer->removeAllShapes();
+		//viewer->removeAllShapes();
 
 		for(int iter=0; iter<skeleton_iteration; iter++)
 		{
@@ -1898,6 +3439,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 				boost::add_edge(sv_s, sv_t, sv_graph);
 			}
+
+			if(iter == 0) sv_graph_origional = sv_graph;
 
 #if 0
 			std::vector<int> component(boost::num_vertices(sv_graph));
@@ -2051,10 +3594,17 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 			}
 #endif
 
-
 			super_cloud_in->clear();
 
 			float total_motion = 0.0f;
+
+			//viewer->addPointCloud(color_cloud, "color_cloud");
+			//viewer->spin();
+			
+#if 0
+			//for(int i=0; i<num_v; i++) sv_graph[i].supervoxel->centroid_.getVector3fMap() = P_new.row(i).transpose();
+						
+			
 	
 			BGL_FORALL_VERTICES(vertex, sv_graph, sv_graph_t)
 			{
@@ -2068,13 +3618,13 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 				if(num_neighbors == 0)
 					continue;				
-				else if(num_neighbors == 1)
-				{
+				else if(num_neighbors == 1) {
+
 					*super_cloud_in += *supervoxel->voxels_;
 					continue;
 				}
-				else if(num_neighbors == 2)
-				{
+				else if(num_neighbors == 2) {
+
 					std::vector<sv_vertex_t> two_adjs;
 
 					BGL_FORALL_ADJ(vertex, adj_v, sv_graph, sv_graph_t) two_adjs.push_back(adj_v);
@@ -2099,8 +3649,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 					if( !triangle 
 					    && dir_1.dot(dir_2) < -0.95f
-					  ) 
-					{
+					  ) {
 						*super_cloud_in += *supervoxel->voxels_;
 						continue;
 					}
@@ -2115,8 +3664,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 
 				float weight_sum = 0.0f;
 
-				BGL_FORALL_ADJ(vertex, adj_v, sv_graph, sv_graph_t)
-				{
+				BGL_FORALL_ADJ(vertex, adj_v, sv_graph, sv_graph_t) {
+
 					pcl::Supervoxel<PointT>::Ptr neighbor_supervoxel = sv_graph[adj_v].supervoxel;
 
 					neighbor_centroids->push_back(neighbor_supervoxel->centroid_);
@@ -2165,6 +3714,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 				*super_cloud_in += *supervoxel->voxels_;
 			}
 
+#endif
+
 			BGL_FORALL_EDGES(edge, sv_graph, sv_graph_t)
 			{
 				sv_vertex_t s = boost::source(edge, sv_graph);
@@ -2187,6 +3738,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 		}
 
 #if 1
+
 		std::vector<int> component(boost::num_vertices(sv_graph));
 
 		int num_cc = boost::connected_components(sv_graph, &component[0]);
@@ -2298,7 +3850,16 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	*/
 
 	//	viewer->addLine(p1, p2, 1, 0, 0, "line"+to_string(cv::getTickCount()));	
-		viewer->addPointCloud(colored_cloud, "super", 0);
+
+		BGL_FORALL_EDGES(edge, sv_graph_origional, sv_graph_t)
+		{
+			sv_vertex_t s = boost::source(edge, sv_graph_origional);
+			sv_vertex_t t = boost::target(edge, sv_graph_origional);
+
+			viewer->addLine(sv_graph_origional[s].supervoxel->centroid_, sv_graph_origional[t].supervoxel->centroid_, 0, 1, 1, "line"+std::to_string(cv::getTickCount()), 0);
+		}
+
+		viewer->addPointCloud(colored_cloud, "superv", 0);
 		viewer->spin();
 		viewer->removeAllPointClouds();
 		viewer->removeAllShapes();
@@ -3088,10 +4649,7 @@ void detectStems(PointCloudT::Ptr plant_cloud, NormalCloudT::Ptr plant_normals, 
 	NormalCloudT::Ptr normal(new NormalCloudT);
 	NormalCloudT::Ptr tmp_normal(new NormalCloudT);
 
-
 	*normal = *plant_normals;
-
-
 
 	for(int i=0; i<4; i++)
 	{
@@ -3189,33 +4747,34 @@ void detectStems(PointCloudT::Ptr plant_cloud, NormalCloudT::Ptr plant_normals, 
 
 void addNormal(PointCloudT::Ptr cloud, PointNCloudT::Ptr cloud_with_normals)
 {
-  NormalCloudT::Ptr normals (new NormalCloudT);
+	NormalCloudT::Ptr normals (new NormalCloudT);
 
-  pcl::search::KdTree<PointT>::Ptr searchTree (new pcl::search::KdTree<PointT>);
-  searchTree->setInputCloud (cloud);
+	pcl::search::KdTree<PointT>::Ptr searchTree (new pcl::search::KdTree<PointT>);
+	searchTree->setInputCloud (cloud);
 
-  pcl::NormalEstimation<PointT, pcl::Normal> normalEstimator;
-  normalEstimator.setInputCloud( cloud );
-  normalEstimator.setSearchMethod(searchTree);
-  normalEstimator.setRadiusSearch(normal_radius);
-  normalEstimator.compute(*normals);
-  
-  pcl::concatenateFields(*cloud, *normals, *cloud_with_normals);
+	pcl::NormalEstimation<PointT, pcl::Normal> normalEstimator;
+	normalEstimator.setInputCloud( cloud );
+	normalEstimator.setSearchMethod(searchTree);
+	normalEstimator.setRadiusSearch(normal_radius);
+	normalEstimator.compute(*normals);
+
+	pcl::concatenateFields(*cloud, *normals, *cloud_with_normals);
 }
 
 
-bool processDepthFrameFileName(std::string data_folder, std::string section, std::vector<std::vector<DepthFrame>> & depth_frame_vec_vec,
+
+bool processDepthFrameFileName(std::string data_folder, std::vector<std::vector<DepthFrame>> & depth_frame_vec_vec,
 			       std::vector<PointCloudT::Ptr> & gps_cloud_vec, std::vector<std::vector<int>> & row_frame_range_vec_vec)
 {
 	std::vector<path> sensor_folder_vec;
 
 	for(int i=1; i<=4; i++)
 	{
-		path sensor_folder = data_folder + "/" + std::to_string(i) + section;
+		path sensor_folder = data_folder + "/" + std::to_string(i);
 
 		if(!exists(sensor_folder)) 
 		{
-			std::cout<< "sensor "<<i<<section<<" folder does not exists\n";
+			std::cout<< "sensor "<<i<<" folder does not exists\n";
 			return false;
 		}
 
@@ -3576,10 +5135,69 @@ bool processDepthFrameFileName(std::string data_folder, std::string section, std
 	return true;
 }
 
-int main()
+std::string dateID2dateStr(int date_id) {
+
+	switch(date_id) {
+
+		case 0:
+			return "0702";
+		case 1:
+			return "0709";
+		case 2:
+			return "0715";
+		case 3:
+			return "0723";
+		case 4:
+			return "0730";
+		case 5:
+			return "0806";
+		case 6:
+			return "0812";
+		case 7:
+			return "0820";
+		case 8:
+			return "0827";
+		case 9:
+			return "0903";
+		default:
+			return "";
+	}
+}
+
+int main(int argc , char** argv)
 {
+	if(argc != 3) {
 
+		cout<<"year id (0, 1), date id\n";
+		return -1;
+	}
 
+	int year_id = atoi(argv[1]);
+
+	if( year_id < 0 || year_id > 1) {
+
+		cout<<"wrong year id\n";
+		return -1;
+	}
+
+	int date_id = atoi(argv[2]);
+
+	if( year_id == 0 ) {
+		
+		if(date_id < 0 || date_id > 3) {
+
+			cout<<"wrong date id\n";
+			return -1;
+		}
+	}
+	else if( year_id == 1 ) {
+
+		if(date_id < 0 || date_id > 9) {
+
+			cout<<"wrong date id\n";
+			return -1;
+		}
+	}
 
 	cv::FileStorage fs("parameters.yml", cv::FileStorage::READ);
 	fs["rr_num_neighbor"] >> rr_num_neighbor;
@@ -3605,13 +5223,16 @@ int main()
 	fs["h_granularity"] >> h_granularity;
 	fs["skeleton_iteration"] >> skeleton_iteration;
 	fs["step_size"] >> step_size;
+	fs["min_linearity"] >> min_linearity;
+	fs["min_branch_size"] >> min_branch_size;
+	fs["data_set"] >> data_set;
 
 	fs.release();
 
 	std::cout<<"parameters loaded\n";
 
 	boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
-//	viewer->addCoordinateSystem(0.25);
+//	viewer->addCoordinateSystem(0.1);
 	viewer->registerPointPickingCallback(&pp_callback);
 	viewer->setSize(900,700);
 //	viewer->setBackgroundColor(0.8, 0.8, 0.8, 0);
@@ -3621,8 +5242,105 @@ int main()
 	cur_depth_cv.create(depth_width, depth_height, CV_8U);
 	pre_pre_depth_cv.create(depth_width, depth_height, CV_8U);
 
-	
-	std::string data_folder = "Data/081215";
+	BGRD bgrd_buffer[depth_size];
+
+	std::string data_folder = "";
+
+	if( year_id == 0 ) {
+
+		switch(date_id) {
+			case 0: 
+				data_folder = "Data/081115";
+				break;
+			case 1:
+				data_folder = "Data/081215";
+				break;
+			case 2:
+				data_folder = "Data/081315";
+				break;
+			case 3:
+				data_folder = "Data/081415";
+				break;
+		}
+	}
+	else if( year_id == 1 ) {
+
+		data_folder = "CornData2017";
+
+		for(int date_id = 0; date_id < 10; date_id++) {
+
+			std::string date_folder_str = data_folder + "/" + dateID2dateStr(date_id);
+
+			cout<<"date id "<<date_id<<"\n";
+
+			for(int plant_id = 0; plant_id < 20; plant_id++) {
+
+				path plant_folder_path = date_folder_str + "/" + to_string(plant_id+1);
+
+				if( date_id < 2 ) {
+
+					recursive_directory_iterator it(plant_folder_path);
+					recursive_directory_iterator endit;
+
+					while (it != endit)
+					{
+						if (is_regular_file(*it) && it->path().extension() == ".bgrd") {
+
+							PointCloudT::Ptr cloud(new PointCloudT);
+
+							readDataBinaryFile(it->path().string(), bgrd_buffer);
+
+							readBGRD2PointCloud(bgrd_buffer, cloud, 1, 0.5f, 2.0f, true);	
+			
+							viewer->removeAllPointClouds();
+
+							viewer->addPointCloud(cloud, "cloud");
+
+							viewer->spin(); 
+						}
+
+						++it;
+					}
+
+				}
+				else {
+
+					path plant_folder_path_0 = date_folder_str + "/" + to_string(plant_id+1) + "/" + "0";
+
+					recursive_directory_iterator it(plant_folder_path_0);
+					recursive_directory_iterator endit;
+
+					while (it != endit)
+					{
+						if (is_regular_file(*it) && it->path().extension() == ".bgrd") {
+
+							PointCloudT::Ptr cloud(new PointCloudT);
+
+							readDataBinaryFile(it->path().string(), bgrd_buffer);
+
+							readBGRD2PointCloud(bgrd_buffer, cloud, 1, 0.5f, 2.0f, true);	
+			
+							viewer->removeAllPointClouds();
+
+							viewer->addPointCloud(cloud, "cloud");
+
+							viewer->spin(); 
+						}
+
+						++it;
+					}
+
+
+
+				}
+				
+
+			}
+
+		}
+
+		return 0;
+	}
 
 	std::vector<std::vector<DepthFrame>> depth_frame_vec_vec;
 
@@ -3631,7 +5349,7 @@ int main()
 	std::vector<std::vector<int>> row_frame_range_vec_vec;
 
 	double t = (double)cv::getTickCount();
-	processDepthFrameFileName(data_folder, "a", depth_frame_vec_vec, gps_cloud_vec, row_frame_range_vec_vec);
+	processDepthFrameFileName(data_folder, depth_frame_vec_vec, gps_cloud_vec, row_frame_range_vec_vec);
 	std::cout <<"process file name time:"<< ((double)cv::getTickCount() - t) / cv::getTickFrequency() << std::endl;
 
 	int sensor_id = 3;
@@ -3716,7 +5434,7 @@ int main()
 
 	float vox_viz_size = 0.04f;
 
-	BGRD bgrd_buffer[depth_size];
+	
 
 	pcl::VoxelGrid<PointT> vox;
 	vox.setLeafSize(vox_size, vox_size, vox_size);
@@ -3750,7 +5468,7 @@ int main()
 	
 				readDataBinaryFile(df->file_path, bgrd_buffer);
 				PointCloudT::Ptr cloud(new PointCloudT);
-				readBGRD2PointCloud(bgrd_buffer, cloud, frame_idx%4, false);
+				readBGRD2PointCloud(bgrd_buffer, cloud, frame_idx%4, 0.5f, 1.524f, false);
 
 				if(cloud->points.size() < 400) continue;
 
@@ -3879,7 +5597,7 @@ int main()
 	
 			readDataBinaryFile(df->file_path, buffer);
 			PointCloudT::Ptr cloud(new PointCloudT);
-			readBGRD2PointCloud(buffer, cloud, i%4, false);
+			readBGRD2PointCloud(buffer, cloud, i%4, 0.5f, 1.524f, false);
 
 			if(cloud->points.size() < 100) continue;
 
