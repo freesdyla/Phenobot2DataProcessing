@@ -149,6 +149,13 @@ float step_size;
 float min_linearity;
 int min_branch_size;
 int data_set = 0;	//0 2015; 1 2017
+float min_z = 0.5f;
+float max_z = 1.2f;
+float stem_verticality = 0.9f;
+int start_plant_id = 0;
+float max_stem_radius = 0.3f;
+float slice_thickness = 0.01f;
+float max_spatial_res = 0.004f;
 
 const double utm_o_x = 441546.;
 const double utm_o_y = 4654933.;
@@ -298,17 +305,18 @@ float dist3D_Segment_to_Segment(std::pair<Eigen::Vector3f, Eigen::Vector3f> & S1
 // orthogonal least squares fit with libeigen
 // rc = largest eigenvalue
 //
-int orthogonal_LSQ(const PointCloud3 &pc, Vector3d* a, Vector3d* b)
+float orthogonal_LSQ(const PointCloud3 &pc, Vector3d* a, Vector3d* b)
 {
-	int rc = 0;
+	float rc = 0.f;
 
 	// anchor point is mean value
 	*a = pc.meanValue();
 
 	// copy points to libeigen matrix
 	Eigen::MatrixXf points = Eigen::MatrixXf::Constant(pc.points.size(), 3, 0);
-	for (int i = 0; i < points.rows(); i++)
-	{
+
+	for (int i = 0; i < points.rows(); i++)	{
+
 		points(i,0) = pc.points.at(i).x;
 		points(i,1) = pc.points.at(i).y;
 		points(i,2) = pc.points.at(i).z;
@@ -325,6 +333,7 @@ int orthogonal_LSQ(const PointCloud3 &pc, Vector3d* a, Vector3d* b)
 	// we need eigenvector to largest eigenvalue
 	// libeigen yields it as LAST column
 	b->x = eigvecs(0,2); b->y = eigvecs(1,2); b->z = eigvecs(2,2);
+
 	rc = eig.eigenvalues()(2);
 
 	return (rc);
@@ -332,7 +341,7 @@ int orthogonal_LSQ(const PointCloud3 &pc, Vector3d* a, Vector3d* b)
 
 int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer, 
 		std::vector<Eigen::Vector3f> & a_vec, std::vector<Eigen::Vector3f> & b_vec,
-		double opt_dx = 0.04, int opt_nlines = 4, int opt_minvotes = 2, int granularity = 4)
+		double opt_dx = 0.04, int opt_nlines = 4, int opt_minvotes = 2, int granularity = 4, float verticality = 0.9f)
 {
 
 	// number of icosahedron subdivisions for direction discretization
@@ -371,7 +380,9 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 
 	// center cloud and compute new bounding box
 	X.getMinMax3D(&minP, &maxP);
+
 	d = (maxP-minP).norm();
+
 	if (d == 0.0) {
 
 		fprintf(stderr, "Error: all points in point cloud identical\n");
@@ -401,7 +412,7 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 
 	try {
 
-		hough = new Hough(minPshifted, maxPshifted, opt_dx, granularity);
+		hough = new Hough(minPshifted, maxPshifted, opt_dx, granularity, verticality);
 	} 
 	catch (const std::exception &e) {
 
@@ -419,7 +430,7 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 	// iterative Hough transform
 	// (Algorithm 1 in IPOL paper)
 	PointCloud3 Y;	// points close to line
-	double rc;
+	float rc;
 	unsigned int nvotes;
 	int nlines = 0;
 	do {
@@ -432,19 +443,29 @@ int Hough3DLine(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualization::PC
 		
 		X.pointsCloseToLine(a, b, opt_dx, &Y);
 
-		rc = orthogonal_LSQ(Y, &a, &b);
-		if ( rc == 0.0 ) break;
+/*		rc = orthogonal_LSQ(Y, &a, &b);
+
+		if ( rc < 1e-4f ) {
+			//cout<<"1. rc = 0\n";
+			break;
+		}
 
 		X.pointsCloseToLine(a, b, opt_dx, &Y);
-
+*/
 		nvotes = Y.points.size();
 
-		if ( nvotes < (unsigned int)opt_minvotes ) break;
+		if ( nvotes < (unsigned int)opt_minvotes ) {
+			//cout<<"nvotes < minvotes\n";
+			break;
+		}
 
-		rc = orthogonal_LSQ(Y, &a, &b);
+/*		rc = orthogonal_LSQ(Y, &a, &b);
 
-		if ( rc == 0.0 ) break;
-
+		if ( rc == 1e-4f ) {
+			//cout<<"2. rc = 0\n";
+			break;
+		}
+*/
 		a = a + X.shift;
 
 		nlines++;
@@ -495,6 +516,7 @@ struct SVVertexProperty
 	//float x, y, z;
 	//PointCloudT cloud;
 	uint32_t index;
+	float max_width;
 	int vertex;
 	bool near_junction = false;
 	std::vector<uint32_t> children;
@@ -793,19 +815,56 @@ void readDataBinaryFile(std::string file_name, BGRD* buffer) {
 
 cv::Mat cur_depth_cv, pre_depth_cv, pre_pre_depth_cv, depth_canvas_cv;
 
-void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f stem_dir, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer) {
+void skeleton(PointCloudT::Ptr cloud, Eigen::Vector4f & plane_coeffs, boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer) {
 
 	if(cloud->size() < 100) return;
-
+	
 	PointCloudT::Ptr filtered_cloud(new PointCloudT);	
 
 	PointCloudT::Ptr tmp_cloud(new PointCloudT);	
 
+	pcl::PCA<PointT> pca;
+
+	pca.setInputCloud(cloud);
+
+	pcl::KdTreeFLANN<PointT> kdtree;
+
+	kdtree.setInputCloud(cloud);
+
+	std::vector<int> indices;
+
+	int index = 0;
+	
+	// filter line-like flying pixels 
+	for(auto & p : cloud->points) {
+
+		std::vector<int> k_indices; std::vector<float> k_sqr_distances;
+
+		if( kdtree.nearestKSearch(p, 5, k_indices, k_sqr_distances) == 5) {		
+
+			pca.setIndices(boost::make_shared<std::vector<int>>(k_indices));
+
+			Eigen::Vector3f eigen_values = pca.getEigenValues();
+
+			const float linearity = (eigen_values(0)-eigen_values(1))/eigen_values(0);
+
+			if(linearity < 0.8f) 
+				indices.push_back(index);
+		}
+		else
+			cout<<"kdtree search fail\n";
+
+		++index;
+	}
+
+#if 1
 	pcl::StatisticalOutlierRemoval<PointT> sor;
 	sor.setInputCloud(cloud);
-	sor.setMeanK(10);
-	sor.setStddevMulThresh(1.0);
+	sor.setIndices(boost::make_shared<std::vector<int>>(indices));
+	sor.setMeanK(sor_meank);
+	sor.setStddevMulThresh(sor_std);
 	sor.filter(*filtered_cloud);
+#endif
 
 	Eigen::Vector4f min_pt, max_pt;
 
@@ -822,17 +881,22 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 	pass_in_cluster.setFilterFieldName ("x");
 	pass_in_cluster.setInputCloud(filtered_cloud);
 
-
-	float slice_thickness = 0.01f;
-
 	viewer->removeAllPointClouds();
 	viewer->removeAllShapes();
 
 	pcl::search::KdTree<PointT>::Ptr tree (new pcl::search::KdTree<PointT>);
 	tree->setInputCloud (filtered_cloud);
+
+	
+	pca.setInputCloud(filtered_cloud);
+	pcl::PointIndices::Ptr point_indices(new pcl::PointIndices);
+
+	pcl::MomentOfInertiaEstimation<PointT> feature_extractor;
+	feature_extractor.setInputCloud(filtered_cloud);
+	feature_extractor.setAngleStep(400.f);
 	
 	pcl::EuclideanClusterExtraction<PointT> ec;
-	ec.setClusterTolerance (0.007); // 2cm
+	ec.setClusterTolerance (slice_thickness); // 2cm
 	ec.setMinClusterSize (10);
 	ec.setMaxClusterSize (25000);
 	ec.setSearchMethod (tree);
@@ -848,7 +912,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 	bool first_slice = true;	
 	
-	pcl::KdTreeFLANN<PointT> kdtree;
+
 
 	kdtree.setInputCloud(filtered_cloud);
 
@@ -881,7 +945,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 			for(int i=0; i<cluster_indices.size(); i++) {
 
-				Eigen::Vector4f centroid;
+				Eigen::Vector4f centroid;				
 
 				pcl::compute3DCentroid(*filtered_cloud, cluster_indices[i], centroid);
 
@@ -902,7 +966,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 			continue;
 		}
 
-		pass_in_cluster.setFilterLimits (x, x+slice_thickness);
+		pass_in_cluster.setFilterLimits (x, x + slice_thickness);
 
 		for(auto & two_layer_cluster : cluster_indices) {
 
@@ -995,12 +1059,14 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 		cnt++;
 	}
 
+	cout<<endl;
+
 	viewer->addPointCloud(filtered_cloud, "slice cloud");
 
 
 /*	BGL_FORALL_VERTICES(v, skeleton_graph, sv_graph_t) {
 
-		uint32_t rgb = 0 << 16 | 255 << 8 | 0;
+		rgb = 0 << 16 | 255 << 8 | 0;
 
 		filtered_cloud->points[skeleton_graph[v].index].rgb = *reinterpret_cast<float*>(&rgb);
 
@@ -1057,24 +1123,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 		boost::tie(new_e, edge_added) = boost::add_edge(s, t, mst);
 
-	/*	mst[s].index = skeleton_graph[s].index;
-
-		mst[s].children = skeleton_graph[s].children;
-
-		mst[s].parents = skeleton_graph[s].parents;
-
-		mst[s].cluster_indices = skeleton_graph[s].cluster_indices;
-
-		mst[t].index = skeleton_graph[t].index;
-
-		mst[t].children = skeleton_graph[t].children;
-
-		mst[t].parents = skeleton_graph[t].parents;
-
-		mst[t].cluster_indices = skeleton_graph[t].cluster_indices;
-*/
 		mst[new_e].weight = skeleton_graph[e].weight;
-
 	}
 
 	viewer->removeAllShapes();
@@ -1158,7 +1207,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 	// refine branching points
 #if 1
-	float stop_branching_dist = 0.02f;
+	const float stop_branching_dist = max_stem_radius;
 	while(true)
 	{
 		bool modify = false;
@@ -1492,14 +1541,9 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 	//viewer->spin();
 
 
-	pcl::PCA<PointT> pca;
-
-	pca.setInputCloud(filtered_cloud);
-
-	pcl::PointIndices::Ptr point_indices(new pcl::PointIndices);
-
 
 	// break V type segments
+	point_indices->indices.clear();
 	std::vector<std::pair<int, int>> segment_to_break_indices;	//with index of the breaking node
 
 	int seg_idx = 0;
@@ -1575,14 +1619,16 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 	centroid_cloud->clear();
 
 	BGL_FORALL_VERTICES(v, mst, sv_graph_t)
-		if( boost::out_degree(v, mst) > 0 )
+		if( boost::out_degree(v, mst) > 0 
+		  // && mst[v].max_width < 0.04f
+		  ) 
 			centroid_cloud->push_back(filtered_cloud->points[mst[v].index]);
 
 	cout<<"centroids size "<<centroid_cloud->size()<<"\n";
 
 	std::vector<Eigen::Vector3f> a_vec, b_vec;
 
-	Hough3DLine(centroid_cloud, viewer, a_vec, b_vec, h_dx, h_nlines, h_minvotes, h_granularity);
+	Hough3DLine(centroid_cloud, viewer, a_vec, b_vec, max_stem_radius, h_nlines, h_minvotes, h_granularity, stem_verticality);
 
 	//viewer->removeAllShapes();
 
@@ -1597,7 +1643,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 	//std::cout<<"num line detected "<<a_vec.size()<<"\n";
 
-	float line_len = 1.1f;
+	float line_len = max_pt(0) - min_pt(0);//1.1f;
 
 	std::vector<int> valid_stem_line_indices;
 
@@ -1605,12 +1651,13 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 		bool valid_line = true;
 
-		//check root position and line direction
-		if( a_vec[i](2) > 1.3f || a_vec[i](2) < 0.7f || b_vec[i](0) > -0.9) valid_line = false;
+		//check root position
+//		if( a_vec[i](2) > 1.3f || a_vec[i](2) < 0.7f ) valid_line = false;
 		
 		for (int j=0; valid_line && j<i; j++) {
 
 			std::pair<Eigen::Vector3f, Eigen::Vector3f> segment1(a_vec[i], a_vec[i] + line_len*b_vec[i]);
+
 			std::pair<Eigen::Vector3f, Eigen::Vector3f> segment2(a_vec[j], a_vec[j] + line_len*b_vec[j]);
 
 			float l2l_dist = dist3D_Segment_to_Segment(segment1, segment2);
@@ -1643,9 +1690,12 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 	// label stem inlier slices
 	std::vector<int> stem_inlier_map(boost::num_vertices(mst), -1);
 
-	rgb = 255 << 16 | 255 <<8 | 255;
+	rgb = 255<<16 | 255<<8 | 255;
 
 	BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+		if(boost::out_degree(v, mst) == 0)
+			continue;
 
 		float min_dist = std::numeric_limits<float>::max();
 
@@ -1665,27 +1715,23 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 			}
 		}
 
-		if(best_idx != -1 && min_dist < 0.02f) {
+		if(best_idx != -1 && min_dist < max_stem_radius) {
 		
 			stem_inlier_map[v] = best_idx;
 
-			for(auto & i : mst[v].cluster_indices)
-				filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+			
+			for(auto & i : mst[v].cluster_indices) filtered_cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
 		}			
 	}
 
 	viewer->updatePointCloud(filtered_cloud, "slice cloud");
 
 	
-
-
-
 #if 0
-
 	// find vertices on stems
 	point_indices->indices.resize(3);
 
-	rgb = 255<<16 | 255<<8 | 255;
+	rgb = 180<<16 | 255<<8 | 255;
 
 	for(auto & segment : segment_vec) {
 
@@ -1755,8 +1801,6 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 				}
 			}
 
-		
-
 		}
 
 	}
@@ -1768,6 +1812,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 	// plant segmentation
 #if 1
 	std::vector<int> stem_id_for_segment(segment_vec.size(), -1);
+
 	std::vector<bool> first_node_end_map(segment_vec.size(), true);	// is segment.front() the node closest to the stem line?
 
 	rgb = 255<<16 | 255<<8 | 0;
@@ -1916,7 +1961,6 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 			if( end_point(0) > connect_point(0) || !first_node_end_map[seg_idx])
 				vertices_to_clear.push_back(segment.front());
-
 		}	
 
 		++seg_idx;
@@ -1937,31 +1981,25 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 		viewer->addLine(filtered_cloud->points[s_idx], filtered_cloud->points[t_idx], 1, 1, 1, to_string(cv::getTickCount()));		
 	}
 
-	for(auto & stem_line_id : valid_stem_line_indices) {
-
-		PointT p0, p1;
-	
-		p0.getVector3fMap() = a_vec[stem_line_id];
-
-		p1.getVector3fMap() = a_vec[stem_line_id] + line_len*b_vec[stem_line_id];
-
-		viewer->addLine(p0, p1, 1, 0, 0, "line"+to_string(cv::getTickCount()));
-	}
-
 
 	std::vector<int> cc(boost::num_vertices(mst));
 	
 	int num = boost::connected_components(mst, &cc[0]);
 
 
-	// find plant orientation
-	std::vector<Eigen::Vector3f> plant_plane_normals(valid_stem_line_indices.size());
+	//**********************************find plant orientation**************************************************
+	Eigen::Vector3f point_on_plane = Eigen::Vector3f::Zero();
+
+	point_on_plane(0) = -plane_coeffs(3)/plane_coeffs(0);
+	
+	std::map<int, Eigen::Vector3f> plant_orientation_map;
 
 	for(auto & stem_line_index : valid_stem_line_indices) {
 
 		point_indices->indices.clear();
 
 		Eigen::Vector3f & base_point = a_vec[stem_line_index];
+
 		Eigen::Vector3f & line_dir = b_vec[stem_line_index];
 
 		BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
@@ -1970,25 +2008,201 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 			float point_to_line_dist = (vector - vector.dot(line_dir)*line_dir).norm();
 
-			if(point_to_line_dist < 0.1f) {
-
+			if(point_to_line_dist < 0.1f)
 				point_indices->indices.push_back(mst[v].index);
-			}
 		}
 
 		pca.setIndices(point_indices);
 
 		Eigen::Vector3f middle_vector = pca.getEigenVectors().col(1);
 
-		plant_plane_normals.push_back(middle_vector);
+		if(middle_vector(2) < 0.f) 
+			middle_vector *= -1.0f;
 
-		PointT p0; p0.getVector3fMap() = base_point;
+		float d = (point_on_plane - base_point).dot(plane_coeffs.head<3>())/(line_dir.dot(plane_coeffs.head<3>()));
 
-		PointT p1; p1.getVector3fMap() = base_point+0.1f*middle_vector;
+		Eigen::Vector3f line_plane_intersection = base_point + d*line_dir;
+
+		PointT p0; p0.getVector3fMap() = line_plane_intersection;
+
+		middle_vector = middle_vector - middle_vector.dot(line_dir)*line_dir;
+
+		middle_vector.normalize();
+
+		plant_orientation_map.insert( std::pair<int, Eigen::Vector3f>(stem_line_index, middle_vector) );		
+
+		PointT p1; p1.getVector3fMap() = line_plane_intersection - 0.1f*middle_vector;
 
 		viewer->addLine(p0, p1, 1,1,0, "line"+to_string(cv::getTickCount()));
 	}
+	
+	//*************************************************plant height***************************************************
+	std::map<int, Eigen::Vector3f> plant_base_map;
 
+	for(auto & stem_line_id : valid_stem_line_indices) {
+
+		//compute intersection of stem line and ground plane
+		Eigen::Vector3f & base_point = a_vec[stem_line_id];
+
+		Eigen::Vector3f & line_dir = b_vec[stem_line_id];
+	
+		float d = (point_on_plane - base_point).dot(plane_coeffs.head<3>())/(line_dir.dot(plane_coeffs.head<3>()));
+
+		Eigen::Vector3f line_plane_intersection = base_point + d*line_dir;
+
+		plant_base_map.insert( std::pair<int, Eigen::Vector3f>(stem_line_id, line_plane_intersection) );
+
+		PointT p0, p1;
+	
+		p0.getVector3fMap() = line_plane_intersection;
+
+		p1.getVector3fMap() = line_plane_intersection + line_len*b_vec[stem_line_id];
+
+		viewer->addLine(p0, p1, 1, 0, 0, "line"+to_string(cv::getTickCount()));
+
+		// search plant top vertex
+		float max_dist = 0.0f;
+
+		Eigen::Vector3f best_plant_top;
+
+		BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+			if(stem_line_id != stem_inlier_map[v]) 
+				continue;
+			
+			Eigen::Vector3f p = filtered_cloud->points[mst[v].index].getVector3fMap();
+
+			// projection on line
+			p = (p-base_point).dot(line_dir)*line_dir + base_point;
+
+			float tmp_dist = (p-line_plane_intersection).norm();
+
+			if( tmp_dist > max_dist ) {
+
+				max_dist = tmp_dist;
+
+				best_plant_top = p;
+			}
+		}
+
+		if(max_dist != 0.0f) {
+			
+			PointT pt; pt.getVector3fMap() = best_plant_top;
+			
+			viewer->addText3D(to_string(max_dist), pt, 0.01);
+		}
+	}
+
+
+	//**********************************stem diameter********************************
+	for(auto & stem_line_id : valid_stem_line_indices) {
+	
+		Eigen::Vector3f & plant_base = plant_base_map.find(stem_line_id)->second;
+	
+		BGL_FORALL_VERTICES(v, mst, sv_graph_t) {
+
+			if( stem_inlier_map[v] != stem_line_id )
+				continue;
+				
+			if( mst[v].near_junction )
+				continue;
+				
+			//Eigen::Vector3f slice_centroid;// = filtered_cloud->points[mst[v].index].getVector3fMap();
+			
+			Eigen::Vector4f centroid4;
+			
+			Eigen::Vector3f slice_centroid;
+			
+			pcl::compute3DCentroid(*filtered_cloud, mst[v].cluster_indices, centroid4);
+			
+			slice_centroid = centroid4.head(3);
+			
+			float slice_height = (slice_centroid - plant_base).norm();
+			
+			if(slice_height > 0.2f)
+				continue;
+
+			Eigen::Vector3f line_dir = -b_vec[stem_line_id];	// align with world frame
+			
+			cout<<"line dir "<<line_dir.transpose()<<"\n";
+
+			PointCloudT::Ptr slice_cloud(new PointCloudT);
+
+			pcl::copyPointCloud(*filtered_cloud, mst[v].cluster_indices, *slice_cloud);
+			
+			Eigen::Vector3f & plant_ori = plant_orientation_map.find(stem_line_id)->second;
+			
+			Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+
+			transform.col(0).head<3>() = line_dir;
+			//transform.col(2).head<3>() = plant_orientation_map.find(stem_line_id)->second;	// plant orientation
+			transform.col(2).head<3>() = (slice_centroid - slice_centroid.dot(line_dir)*line_dir).normalized();	//camera view
+			transform.col(1).head<3>() = transform.col(2).head<3>().cross( transform.col(0).head<3>() );
+			transform.col(3).head<3>() = slice_centroid;
+
+			PointCloudT::Ptr slice_cloud_view(new PointCloudT);
+			
+			pcl::transformPointCloud(*slice_cloud, *slice_cloud_view, transform.inverse());
+
+			Eigen::Vector3f ellipse_center;
+			
+			ellipse_center(0) = 0.0f;
+			
+			Eigen::Vector4f min, max, min1, max1;
+			
+			std::vector<int> one_side_indices;
+			
+		
+			pass.setInputCloud(slice_cloud_view);
+			pass.setFilterFieldName ("y");
+			pass.setFilterLimits (-1.0, .0);
+			pass.filter (one_side_indices);
+			
+			pcl::getMinMax3D(*slice_cloud_view, one_side_indices, min, max);
+			
+			pass.setFilterLimits (0., 1.0);
+			pass.setFilterLimitsNegative (true);
+			pass.filter (one_side_indices);
+			
+			pcl::getMinMax3D(*slice_cloud_view, one_side_indices, min1, max1);
+			
+			ellipse_center(2) = (max1(2) + max(2))*0.5f;
+		
+			pcl::getMinMax3D(*slice_cloud_view, min, max);
+			
+			//if( (max-min)(1) > 2.0f*max_stem_radius )
+			//	continue;
+				
+			ellipse_center(1) = (max(1)+min(1))*0.5f;
+			
+			ellipse_center = transform.topLeftCorner<3,3>()*ellipse_center + transform.col(3).head<3>();
+			
+			transform.col(2).head<3>() = plant_ori;	// plant orientation
+			transform.col(1).head<3>() = transform.col(2).head<3>().cross( transform.col(0).head<3>() );
+			transform.col(3).head<3>() = ellipse_center;
+			
+			pcl::transformPointCloud(*slice_cloud, *slice_cloud_view, transform.inverse());
+			
+
+			
+			float short_diameter = 0.f;
+			
+			for(auto & p : slice_cloud_view->points) 
+				short_diameter += std::sqrt(4.f*p.y*p.y+p.z*p.z);
+				
+			short_diameter /= slice_cloud_view->size();
+			
+			cout<<"short diameter "<<short_diameter<<"\n";
+			
+			viewer->removeShape("line");
+			viewer->removePointCloud("stem");
+			viewer->addPointCloud(slice_cloud_view, "stem");
+			viewer->addLine(filtered_cloud->points[mst[v].index], pcl::PointXYZ(0,0,0), 1,1,1, "line");
+			viewer->spin();
+		}
+	}	
+
+	
 
 #if 1
 	// leaf segmentation
@@ -1996,7 +2210,7 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 	seg_idx = 0;
 
-	float stem_radius = 0.03f;
+	const float stem_radius = max_stem_radius;//0.03f;
 
 	rgb = 255<<16 | 255<<8 | 0;	
 
@@ -2103,7 +2317,6 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 				if( line_to_line_dist < stem_radius ) 
 				{
-
 					int start_v = -1;
 
 					if( first_node_end_map[seg_idx] ) {
@@ -2150,7 +2363,9 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 
 						viewer->addLine( start_point, end_point, r, g, b, "line"+to_string(cv::getTickCount()));
 
-						//float angle = acos(abs_cosine)/M_PI*180.f;	//0~90 degrees
+						float angle = acos(abs_cosine)/M_PI*180.f;	//0~90 degrees
+
+						viewer->addText3D(to_string(angle), end_point, 0.01, r, g, b);
 					}
 				}
 			}
@@ -2370,6 +2585,8 @@ void skeleton(PointCloudT::Ptr cloud, Eigen::Vector3f stem_base, Eigen::Vector3f
 #endif	
 
 	viewer->spin();
+	viewer->removeAllPointClouds();
+	viewer->removeAllShapes();
 
 }
 
@@ -2609,7 +2826,6 @@ void spectralCluster(PointCloudT::Ptr cloud, boost::shared_ptr<pcl::visualizatio
 		
 		for(int v=0; v<num_v; v++) {
 		
-			
 			float min_dist = 1e10f;
 	
 			BGL_FORALL_ADJ(v, adj, sv_graph, sv_graph_t) {
@@ -2792,20 +3008,20 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, float 
 
 	for(int i=0; i<depth_size; i++)	depth_buffer[i] = buffer[i].d;
 
-	for (int y = 1; y < depth_height-1; y++)
-	{
-		for (int x = 1; x < depth_width-1; x++)
-		{
+	for (int y = 1; y < depth_height-1; y++) {
+
+		for (int x = 1; x < depth_width-1; x++)	{
+
 			int centerIdx = y*depth_width + x;
 		
 			int maxJump = 0;
 
 			int centerD = depth_buffer[centerIdx];
 
-			for (int h = -1; h <= 1; h+=1)
-			{
-				for (int w = -1; w <= 1; w+=1)
-				{
+			for (int h = -1; h <= 1; h+=1) {
+
+				for (int w = -1; w <= 1; w+=1) {
+
 					if(h == 0 && w == 0) continue;
 
 					int neighborD = std::abs(centerD - depth_buffer[centerIdx + h*depth_width + w]);
@@ -2837,6 +3053,7 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, float 
 	
 //	cv::imshow("binary", binary);
 
+//	cv::imshow("cur_depth_u16", depth_u16); 
 	cv::imshow("cur_depth", depth_cv); 
 //	cv::imshow("pre_depth", pre_depth_cv);
 //	cv::imshow("pre_pre_depth", pre_pre_depth_cv);
@@ -2845,43 +3062,40 @@ void readBGRD2PointCloud(BGRD* buffer, PointCloudT::Ptr cloud, int color, float 
 //	depth_cv.copyTo(pre_depth_cv);
 #endif
 	
+	uint32_t rgb;
+
+	switch(color) {
+
+		case 0:
+			rgb = 255<<16 | 0<<8 | 0;
+		case 1:
+			rgb = 0<<16 | 0<<8 | 255;
+		case 2: 
+			rgb = 0<<16 | 255<<8 | 0;
+		case 3: 
+			rgb = 255<<16 | 0<<8 | 255;
+	}
+
 	BGRD* ptr = buffer;
-	for(int y=0; y<depth_height; y++)
-	{
-		for(int x=0; x<depth_width; x++, ptr++)
-		{
+	for(int y=0; y<depth_height; y++) {
+
+		for(int x=0; x<depth_width; x++, ptr++) {
+
 			PointT p;
 
 			p.z = ptr->d*0.001f;
 
 			if(p.z > max_z || p.z < min_z) continue;
 
-			if(color_hist_equalization)
-			{
+			if(color_hist_equalization) {
+
 				p.b = img_hist_equalized.at<cv::Vec3b>(y,x)[0];
 				p.g = img_hist_equalized.at<cv::Vec3b>(y,x)[1];
 				p.r = img_hist_equalized.at<cv::Vec3b>(y,x)[2];
 			}
-			else
-			{
-				if(color == 0)
-				{
-					p.r = 255; p.b = 0; p.g = 0;
-				}
-				else if(color == 1)
-				{ 	
-					p.r = 0; p.b =0; p.g = 255;
-				}
-				else if(color == 2)
-				{ 	
-					p.r = 0; p.b =255; p.g = 0;
-				}
-				else if(color == 3)
-				{
-					p.r = 255; p.b =0; p.g = 255;
-				}
-	
-				//p.b = ptr->b; p.g = ptr->g; p.r = ptr->r;
+			else {
+
+				p.rgb = *reinterpret_cast<float*>(&rgb);
 			}
 
 			p.x = (x - 258.6f) / 366.f*p.z;
@@ -3031,7 +3245,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	if(std::abs(coefficients_plane->values[0]) < 0.85)	//check if vertical
 		std::cerr << "Wrong plane coefficients: " << *coefficients_plane << std::endl;
 
-	Eigen::VectorXf plane_eigen(4);
+	Eigen::Vector4f plane_eigen;
 	plane_eigen << coefficients_plane->values[0], coefficients_plane->values[1], coefficients_plane->values[2], coefficients_plane->values[3];
 	pcl::SampleConsensusModelPlane<PointT> scmp(soil_cloud);
 	std::vector<int> refined_inliers_plane;
@@ -3069,7 +3283,8 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 	sor.setStddevMulThresh (sor_std);
 	sor.filter (*tmp_cloud);
 
-	viewer->removeAllShapes(); skeleton(tmp_cloud, Eigen::Vector3f (0,0,0), Eigen::Vector3f (1, 0, 0), viewer); return true;
+
+	viewer->removeAllShapes(); skeleton(tmp_cloud, plane_eigen, viewer); return true;
 
 //	*tmp_cloud = *plant_cloud;
 
@@ -3373,7 +3588,7 @@ bool separatePlantsFromSoil(PointCloudT::Ptr cloud, Eigen::Matrix4f & transform,
 		cout<<"super_cloud_in size "<<super_cloud_in->size()<<"\n";
 
 
-		viewer->removeAllShapes(); skeleton(super_cloud_in, a_vec[i], b_vec[i], viewer); continue;
+		viewer->removeAllShapes(); skeleton(super_cloud_in, plane_eigen, viewer); continue;
 
 	/*	ofstream myfile;
 		myfile.open ("cloud.off");
@@ -5226,13 +5441,20 @@ int main(int argc , char** argv)
 	fs["min_linearity"] >> min_linearity;
 	fs["min_branch_size"] >> min_branch_size;
 	fs["data_set"] >> data_set;
+	fs["min_z"] >> min_z;
+	fs["max_z"] >> max_z;
+	fs["stem_verticality"] >> stem_verticality;
+	fs["start_plant_id"] >> start_plant_id;
+	fs["max_stem_radius"] >> max_stem_radius;
+	fs["slice_thickness"] >> slice_thickness;
+	fs["max_spatial_res"] >> max_spatial_res;
 
 	fs.release();
 
 	std::cout<<"parameters loaded\n";
 
 	boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
-//	viewer->addCoordinateSystem(0.1);
+	viewer->addCoordinateSystem(0.01);
 	viewer->registerPointPickingCallback(&pp_callback);
 	viewer->setSize(900,700);
 //	viewer->setBackgroundColor(0.8, 0.8, 0.8, 0);
@@ -5267,13 +5489,13 @@ int main(int argc , char** argv)
 
 		data_folder = "CornData2017";
 
-		for(int date_id = 0; date_id < 10; date_id++) {
+		for(; date_id < 10; date_id++) {
 
 			std::string date_folder_str = data_folder + "/" + dateID2dateStr(date_id);
 
 			cout<<"date id "<<date_id<<"\n";
 
-			for(int plant_id = 0; plant_id < 20; plant_id++) {
+			for(int plant_id = start_plant_id; plant_id < 20; plant_id++) {
 
 				path plant_folder_path = date_folder_str + "/" + to_string(plant_id+1);
 
@@ -5288,24 +5510,159 @@ int main(int argc , char** argv)
 
 							PointCloudT::Ptr cloud(new PointCloudT);
 
+							cout<<it->path().string()<<"\n";
+
 							readDataBinaryFile(it->path().string(), bgrd_buffer);
 
-							readBGRD2PointCloud(bgrd_buffer, cloud, 1, 0.5f, 2.0f, true);	
+							//flip horizontally and vertically
+							if(date_id == 0) {
+
+								BGRD tmp;
+								
+								for(int y=0; y<depth_height/2; y++) {
+									
+									for(int x=0; x<depth_width; x++) {
+										
+										tmp = bgrd_buffer[y*depth_width+x];
+										bgrd_buffer[y*depth_width+x] = bgrd_buffer[(depth_height-y-1)*depth_width+depth_width-x-1];
+										bgrd_buffer[(depth_height-y-1)*depth_width+depth_width-x-1] = tmp;
+									}
+								}
+							}
+
+							cv::Mat depth; depth.create(depth_height, depth_width, CV_8U);
+
+							cv::Mat mask;
+
+							int size = it->path().string().size();
+
+							mask = cv::imread(it->path().string().substr(0, size-5) + "_mask.pgm", CV_LOAD_IMAGE_GRAYSCALE);
+
+							unsigned char* ptr = depth.ptr<unsigned char>();
+
+							for(int i=0; i<depth_size; ++i, ++ptr) {
+
+								unsigned short & d = bgrd_buffer[i].d;
 			
+								if( d < 500 || d > 2000 ) 
+									*ptr = 255;
+								else 
+									*ptr = (unsigned char)((d - 500)/1500.f*254.f);
+							}
+
+							std::string file_name = it->path().string().substr(0, size-5) + ".pgm";
+
+							cv::imwrite(file_name, depth);
+
+							if(mask.data != NULL) {
+
+								cv::flip(mask, mask, -1);
+	
+								cv::imshow("mask", mask);
+
+								ptr = mask.ptr<unsigned char>();
+								for(int i=0; i<depth_size; i++, ptr+=1)
+									if( (uint32_t)*ptr == 255 )
+										bgrd_buffer[i].d = 0;
+							}
+
+							cv::imshow("depth", depth); cv::waitKey(100);
+
+					
+							readBGRD2PointCloud(bgrd_buffer, cloud, 1, min_z, max_z, true);	
+							
+				
+							pcl::PointIndices::Ptr inliers_plane(new pcl::PointIndices);
+
+							pcl::ModelCoefficients::Ptr coefficients_plane(new pcl::ModelCoefficients);
+
+							pcl::SACSegmentation<PointT> segp;
+							segp.setOptimizeCoefficients(true);
+							segp.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+							segp.setMethodType(pcl::SAC_RANSAC);
+							segp.setMaxIterations(200);
+							segp.setDistanceThreshold(0.02);
+							segp.setInputCloud(cloud);
+							segp.setAxis(Eigen::Vector3f::UnitX());
+							segp.setEpsAngle(pcl::deg2rad(30.));
+							segp.segment (*inliers_plane, *coefficients_plane);	
+
+							Eigen::Vector4f plane_coeffs;
+
+							plane_coeffs << coefficients_plane->values[0],
+										coefficients_plane->values[1],
+										coefficients_plane->values[2],
+										coefficients_plane->values[3];
+
+							
+							
+
+							uint32_t rgb = 180<<16 | 180<<8 | 180;
+
+							for(auto & i : inliers_plane->indices)
+								cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+
+							// align ground with yz plane							
+							Eigen::Matrix4f rot = Eigen::Matrix4f::Identity();
+	
+							rot.col(0).head<3>() = plane_coeffs.head<3>();
+
+							cout<<rot.col(0).head(3).transpose()<<"\n";
+
+							if(rot(0, 0) < 0.f )
+								rot.col(0).head(3) *= -1.0f;
+							
+							rot.col(1).head(3) = Eigen::Vector3f::UnitY() - (rot.col(0).head(3).dot(Eigen::Vector3f::UnitY()))*rot.col(0).head(3);
+							
+							rot.col(1).head(3).normalize();
+
+							rot.col(2).head<3>() = rot.col(0).head<3>().cross(rot.col(1).head<3>());
+
+							pcl::transformPointCloud(*cloud, *cloud, rot.inverse());
+							
+							Eigen::Vector4f new_plane_coeffs;
+
+							new_plane_coeffs = rot.inverse()*plane_coeffs;
+
+
+							PointCloudT::Ptr plant_cloud(new PointCloudT);
+						
+							pcl::ExtractIndices<PointT> extract;
+	
+							extract.setInputCloud(cloud);
+
+							extract.setIndices(inliers_plane);
+
+							extract.setNegative(true);
+
+							extract.filter(*plant_cloud);
+							
 							viewer->removeAllPointClouds();
 
 							viewer->addPointCloud(cloud, "cloud");
 
+						//	viewer->addPlane(*coefficients_plane, "plane"+to_string(cv::getTickCount())); viewer->spin();
+
+							for(int i=0; i<4; i++) coefficients_plane->values[i] = new_plane_coeffs[i];
+
+							viewer->removeAllShapes();
+							
+							viewer->addPlane(*coefficients_plane, "plane"+to_string(cv::getTickCount()));
+
 							viewer->spin(); 
+
+							skeleton(plant_cloud, new_plane_coeffs, viewer);
 						}
 
 						++it;
+
+						break;
 					}
 
 				}
-				else {
+				else if (0){
 
-					path plant_folder_path_0 = date_folder_str + "/" + to_string(plant_id+1) + "/" + "0";
+					path plant_folder_path_0 = date_folder_str + "/" + to_string(plant_id+1) + "/" + "1";
 
 					recursive_directory_iterator it(plant_folder_path_0);
 					recursive_directory_iterator endit;
@@ -5329,8 +5686,6 @@ int main(int argc , char** argv)
 
 						++it;
 					}
-
-
 
 				}
 				

@@ -20,30 +20,40 @@
 
 class Hough {
 public:
-  // accumulator array A
-  std::vector<unsigned int> VotingSpace;
-  // Directions B
-  Sphere *sphere;
-  size_t num_b;
-  // x' and y'
-  float dx, max_x;
-  size_t num_x;
+	// accumulator array A
+	std::vector<unsigned int> VotingSpace;
 
-  // parameter space discretization and allocation of voting space
-  Hough(const Vector3d& minP, const Vector3d& maxP, float dx,
-        unsigned int sphereGranularity);
-  ~Hough();
-  // returns the line with most votes (rc = number of votes)
-  unsigned int getLine(Vector3d* point, Vector3d* direction);
-  // add all points from point cloud to voting space
-  void add(const PointCloud3 &pc);
-  // subtract all points from point cloud to voting space
-  void subtract(const PointCloud3 &pc);
+	// Directions B
+	Sphere *sphere;
+
+	size_t num_b;
+
+	// x' and y'
+	float dx, max_x;
+
+	size_t num_x;
+
+	float verticality_;
+
+	Vector3d minP_, maxP_;
+
+	// parameter space discretization and allocation of voting space
+	Hough(const Vector3d& minP, const Vector3d& maxP, float dx, unsigned int sphereGranularity, float verticality);
+
+	~Hough();
+
+	// returns the line with most votes (rc = number of votes)
+	unsigned int getLine(Vector3d* point, Vector3d* direction);
+
+	// add all points from point cloud to voting space
+	void add(const PointCloud3 &pc);
+
+	// subtract all points from point cloud to voting space
+	void subtract(const PointCloud3 &pc);
 
 private:
-  // add or subtract (add==false) one point from voting space
-  void pointVote(const Vector3d& point, bool add);
-
+	// add or subtract (add==false) one point from voting space
+	void pointVote(const Vector3d& point, bool add);
 };
 
 #endif /* HOUGH_H_ */
